@@ -1,0 +1,11 @@
+fastapi>=0.103.0
+uvicorn>=0.23.2
+websockets>=11.0.3
+numpy>=1.24.3
+torch>=2.1.0
+torchaudio>=2.1.0
+transformers>=4.36.0
+accelerate>=0.25.0
+onnx>=1.15.0
+onnxruntime>=1.16.3
+requests>=2.31.0
