@@ -129,22 +129,21 @@ class STTServer:
                 data = await websocket.receive_bytes()
                 conn_state.update_seen()
                 
-                # Incoming Int16 PCM
-                audio_int16 = np.frombuffer(data, dtype=np.int16)
+                await conn_state.append_audio(data)
                 
-                # Convert to float32 internally inside VAD engine
-                # Silero VAD
-                speech_int16, _ = self.vad_engine.detect_speech(audio_int16)
-                
-                if len(speech_int16) > 0:
-                    # Enqueue
-                    if not self.audio_queue.is_full():
-                        await self.audio_queue.enqueue(conn_id, speech_int16.tobytes())
-                        conn_state.bytes_received += len(data)
-                        conn_state.audio_chunks_received += 1
-                        conn_state.audio_seconds_received += len(audio_int16) / self.config.SAMPLE_RATE
-                    else:
-                        logger.warning(f"Backpressure: Queue full, dropping audio chunk from {conn_id}")
+                # Process only when we have accumulated a full chunk (e.g. 1 second)
+                if len(conn_state.audio_buffer) >= self.config.PCM_CHUNK_SIZE:
+                    audio_int16 = await conn_state.get_and_clear_audio()
+                    
+                    # Silero VAD
+                    speech_int16, _ = self.vad_engine.detect_speech(audio_int16)
+                    
+                    if len(speech_int16) > 0:
+                        # Enqueue
+                        if not self.audio_queue.is_full():
+                            await self.audio_queue.enqueue(conn_id, speech_int16.tobytes())
+                        else:
+                            logger.warning(f"Backpressure: Queue full, dropping audio chunk from {conn_id}")
         except WebSocketDisconnect:
             logger.info(f"Worker disconnected: {conn_id}")
         except Exception as e:
