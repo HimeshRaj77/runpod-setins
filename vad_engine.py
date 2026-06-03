@@ -29,16 +29,14 @@ class VadEngine:
 
         try:
             # Load Silero VAD model
-            self.model, self.get_speech_timestamps, self.save_audio, (
-                self.read_audio,
-                self.state,
-            ) = torch.hub.load(
+            self.model, utils = torch.hub.load(
                 repo_or_dir="snakers4/silero-vad",
                 model="silero_vad",
                 force_reload=False,
                 onnx=True,  # Use ONNX for faster inference
                 verbose=False,
             )
+            self.get_speech_timestamps = utils[0]
 
             self.model.eval()
 
