@@ -3,8 +3,8 @@ fastapi>=0.103.0
 uvicorn>=0.23.2
 websockets>=11.0.3
 numpy>=1.24.3
-torch>=2.4.0
-torchaudio>=2.4.0
+torch==2.4.1+cu121
+torchaudio==2.4.1+cu121
 transformers>=4.45.0
 accelerate>=0.25.0
 onnx>=1.15.0
