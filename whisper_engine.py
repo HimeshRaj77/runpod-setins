@@ -6,6 +6,10 @@ from typing import Dict, List, Optional
 
 import numpy as np
 import torch
+
+if not hasattr(torch, "float8_e8m0fnu"):
+    setattr(torch, "float8_e8m0fnu", torch.float32)
+
 from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
 
 logger = logging.getLogger(__name__)
