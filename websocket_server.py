@@ -189,6 +189,7 @@ class STTServer:
         
         speech_buffer = []
         is_speaking = False
+        silence_samples = 0
 
         try:
             while True:
@@ -203,6 +204,7 @@ class STTServer:
                 speech_int16, _ = self.vad_engine.detect_speech(audio_int16)
                 
                 if len(speech_int16) > 0:
+                    silence_samples = 0
                     # User is speaking - detect barge-in
                     if not is_speaking:
                         is_speaking = True
@@ -225,16 +227,22 @@ class STTServer:
                 else:
                     # Silence detected
                     if is_speaking:
-                        is_speaking = False
-                        # User stopped speaking, send final transcript
-                        if len(speech_buffer) > 0:
-                            if not self.audio_queue.is_full():
-                                await self.audio_queue.enqueue(
-                                    conn_id,
-                                    np.concatenate(speech_buffer).tobytes(),
-                                    is_final=True
-                                )
-                            speech_buffer = [] # Reset buffer
+                        silence_samples += len(audio_int16)
+                        speech_buffer.append(audio_int16) # keep silence for natural pausing
+                        
+                        # Wait for VAD_MIN_SILENCE_DURATION before ending utterance
+                        if silence_samples >= (self.config.VAD_MIN_SILENCE_DURATION * self.config.SAMPLE_RATE):
+                            is_speaking = False
+                            # User stopped speaking, send final transcript
+                            if len(speech_buffer) > 0:
+                                if not self.audio_queue.is_full():
+                                    await self.audio_queue.enqueue(
+                                        conn_id,
+                                        np.concatenate(speech_buffer).tobytes(),
+                                        is_final=True
+                                    )
+                                speech_buffer = [] # Reset buffer
+                            silence_samples = 0
 
                 # Always track stats
                 conn_state.bytes_received += len(data)

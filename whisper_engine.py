@@ -116,12 +116,25 @@ class WhisperEngine:
                 results = [results]
                 
             transcriptions = []
-            hallucinations = ["thank you.", "thank you", "thanks for watching", "please subscribe", "thank you.", "thank you!", "thanks for watching!", "thank you very much.", "you"]
+            
+            # Common Whisper v3 hallucinations on background noise / silence
+            hallucination_phrases = {
+                "thank you", "thanks for watching", "please subscribe", 
+                "thanks for subscribing", "thank you very much", "thank you so much",
+                "subscribe to the channel", "thanks", "you", "i'm sorry", "amara.org",
+                "subscribe", "bye", "okay", "bye bye"
+            }
+            
             for res in results:
                 text = res.get("text", "").strip()
-                # Simple hallucination filter
-                if text.lower() in hallucinations or text.lower().replace(" ", "") == "thankyou":
+                
+                # Normalize text for checking: lowercase and remove punctuation
+                norm_text = "".join(c.lower() for c in text if c.isalpha() or c.isspace()).strip()
+                
+                if norm_text in hallucination_phrases or norm_text.replace(" ", "") == "thankyou":
+                    logger.debug(f"Filtered hallucination: '{text}'")
                     text = ""
+                    
                 transcriptions.append(text)
                 
             latency = time.time() - start_time
