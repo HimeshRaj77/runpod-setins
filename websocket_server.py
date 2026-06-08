@@ -19,18 +19,27 @@ logger = logging.getLogger(__name__)
 
 # ── tunables ─────────────────────────────────────────────────────────────────
 # Client sends 256 ms chunks → 4 096 samples @ 16 kHz.
-CHUNK_MS           = 256
-# How many seconds of audio to keep in the rolling "partial" window.
-# Whisper hallucinates badly on very long audio, so we cap here.
-PARTIAL_WINDOW_SEC = 8          # 8 s → last 31 chunks
+CHUNK_MS              = 256
+
+# How many seconds of audio to keep in each partial payload sent to Whisper.
+# This is the CONTENT window — always the last N seconds of speech.
+PARTIAL_WINDOW_SEC    = 8        # 8 s → last ~31 chunks
+
+# How often to FIRE a partial STT job (measured in new speech samples).
+# 1.5 s means Whisper gets its first result after ~1.5 s of speech,
+# then a fresh result every further 1.5 s, giving early LLM warm-up.
+PARTIAL_SEND_EVERY_SEC = 1.5     # ~6 chunks between each partial
+
 # Consecutive silence before we close the utterance.
-# 640 ms = exactly 2.5 × 256 ms chunks — a clean boundary.
-SILENCE_END_SEC    = 0.640      # ~2.5 chunks
+# 640 ms = 2.5 × 256 ms chunks — a clean boundary.
+SILENCE_END_SEC       = 0.640    # ~2.5 chunks
+
 # Minimum detected speech before we bother running Whisper.
 # 512 ms = 2 full chunks — rejects single mic-blip fragments.
-MIN_SPEECH_SEC     = 0.512      # 2 chunks
-# Hard cap fed to Whisper (its context window is 30 s).
-MAX_UTTERANCE_SEC  = 30
+MIN_SPEECH_SEC        = 0.512    # 2 chunks
+
+# Hard cap fed to Whisper (its 30 s context window).
+MAX_UTTERANCE_SEC     = 30
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -133,6 +142,9 @@ class STTServer:
                     # ── LLM only fires on the FINAL utterance ────────────────
                     if is_final and text:
                         await self.run_llm_pipeline(conn_state, text)
+                        # Mark LLM active so next speech is correctly identified
+                        # as a barge-in (registry does not track this, conn_state does)
+                        conn_state.llm_task  # keep reference
 
             except asyncio.CancelledError:
                 break
@@ -208,14 +220,17 @@ class STTServer:
         sample_rate = self.config.SAMPLE_RATE
 
         # Per-connection VAD state
-        speech_chunks: list[np.ndarray] = []   # accumulated *speech* samples only
-        silence_samples: int = 0
-        is_speaking: bool = False
+        speech_chunks: list[np.ndarray] = []  # accumulated speech samples
+        silence_samples: int  = 0
+        is_speaking: bool     = False
+        llm_is_active: bool   = False         # True once LLM started this turn
+        samples_since_partial: int = 0        # new-speech samples since last partial
 
-        PARTIAL_WINDOW_SAMPLES = int(PARTIAL_WINDOW_SEC * sample_rate)
-        SILENCE_END_SAMPLES    = int(SILENCE_END_SEC    * sample_rate)
-        MIN_SPEECH_SAMPLES     = int(MIN_SPEECH_SEC     * sample_rate)
-        MAX_UTTERANCE_SAMPLES  = int(MAX_UTTERANCE_SEC  * sample_rate)
+        PARTIAL_WINDOW_SAMPLES    = int(PARTIAL_WINDOW_SEC     * sample_rate)
+        PARTIAL_SEND_EVERY        = int(PARTIAL_SEND_EVERY_SEC * sample_rate)
+        SILENCE_END_SAMPLES       = int(SILENCE_END_SEC        * sample_rate)
+        MIN_SPEECH_SAMPLES        = int(MIN_SPEECH_SEC         * sample_rate)
+        MAX_UTTERANCE_SAMPLES     = int(MAX_UTTERANCE_SEC      * sample_rate)
 
         try:
             while True:
@@ -231,34 +246,44 @@ class STTServer:
                 if has_speech:
                     silence_samples = 0
 
-                    # ── Barge-in detection ───────────────────────────────────
                     if not is_speaking:
                         is_speaking = True
-                        conn_state.llm_engine.abort()
-                        conn_state.tts_engine.abort()
-                        logger.info(f"Speech start / barge-in: {conn_id}")
+                        samples_since_partial = 0
+
+                        # Only abort LLM/TTS if they are actually running
+                        if llm_is_active:
+                            conn_state.llm_engine.abort()
+                            conn_state.tts_engine.abort()
+                            logger.info(f"Barge-in: {conn_id} — interrupted active response")
+                        else:
+                            logger.info(f"Speech start: {conn_id}")
 
                     speech_chunks.append(speech_int16)
+                    samples_since_partial += len(speech_int16)
 
-                    # ── Hard cap: prevent Whisper eating >MAX_UTTERANCE_SEC ──
+                    # ── Hard cap: keep buffer within Whisper's context ────────
                     total_samples = sum(len(c) for c in speech_chunks)
                     if total_samples > MAX_UTTERANCE_SAMPLES:
-                        # Trim oldest chunks to stay within the window
                         while speech_chunks and sum(len(c) for c in speech_chunks) > PARTIAL_WINDOW_SAMPLES:
                             speech_chunks.pop(0)
 
-                    # ── Sliding-window partial STT ───────────────────────────
-                    # Send a read-only snapshot of the current window every time
-                    # the buffer is at least PARTIAL_WINDOW_SAMPLES large.
+                    # ── Sliding-window partial STT ────────────────────────────
+                    # Fire every PARTIAL_SEND_EVERY new samples (~1.5 s),
+                    # but only if we have at least MIN_SPEECH_SAMPLES in the buffer.
                     total_samples = sum(len(c) for c in speech_chunks)
-                    if total_samples >= PARTIAL_WINDOW_SAMPLES and not self.audio_queue.is_full():
-                        # Only the LAST PARTIAL_WINDOW_SAMPLES of speech
+                    if (
+                        samples_since_partial >= PARTIAL_SEND_EVERY
+                        and total_samples     >= MIN_SPEECH_SAMPLES
+                        and not self.audio_queue.is_full()
+                    ):
+                        # Send only the last PARTIAL_WINDOW_SAMPLES
                         window = np.concatenate(speech_chunks)[-PARTIAL_WINDOW_SAMPLES:]
                         await self.audio_queue.enqueue(
                             conn_id,
                             window.tobytes(),
                             is_final=False
                         )
+                        samples_since_partial = 0   # reset counter after each send
 
                 else:
                     # ── Silence ──────────────────────────────────────────────
@@ -270,7 +295,6 @@ class STTServer:
                             total_speech = sum(len(c) for c in speech_chunks)
 
                             if total_speech >= MIN_SPEECH_SAMPLES and not self.audio_queue.is_full():
-                                # Cap to MAX_UTTERANCE_SAMPLES before submitting
                                 full_audio = np.concatenate(speech_chunks)
                                 if len(full_audio) > MAX_UTTERANCE_SAMPLES:
                                     full_audio = full_audio[-MAX_UTTERANCE_SAMPLES:]
@@ -279,16 +303,17 @@ class STTServer:
                                     full_audio.tobytes(),
                                     is_final=True
                                 )
-                                logger.debug(
-                                    f"Finalized utterance {total_speech/sample_rate:.2f}s → {conn_id}"
+                                logger.info(
+                                    f"Utterance finalised {total_speech/sample_rate:.2f}s → {conn_id}"
                                 )
                             elif total_speech < MIN_SPEECH_SAMPLES:
                                 logger.debug(
-                                    f"Dropped short fragment {total_speech/sample_rate:.2f}s"
+                                    f"Short fragment {total_speech/sample_rate:.2f}s dropped"
                                 )
 
                             speech_chunks = []
                             silence_samples = 0
+                            samples_since_partial = 0
 
                 # Stats
                 conn_state.bytes_received += len(data)
