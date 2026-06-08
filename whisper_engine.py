@@ -108,6 +108,9 @@ class WhisperEngine:
                     generate_kwargs={
                         "language": self.language if self.language != "auto" else None,
                         "task": self.task,
+                        "condition_on_prev_tokens": False,
+                        "compression_ratio_threshold": 1.35,
+                        "no_speech_threshold": 0.6,
                     },
                 )
             
@@ -115,7 +118,15 @@ class WhisperEngine:
             if isinstance(results, dict):
                 results = [results]
                 
-            transcriptions = [res.get("text", "").strip() for res in results]
+            transcriptions = []
+            hallucinations = ["thank you.", "thank you", "thanks for watching", "please subscribe", "thank you.", "thank you!", "thanks for watching!", "thank you very much.", "you"]
+            for res in results:
+                text = res.get("text", "").strip()
+                # Simple hallucination filter
+                if text.lower() in hallucinations or text.lower().replace(" ", "") == "thankyou":
+                    text = ""
+                transcriptions.append(text)
+                
             latency = time.time() - start_time
             logger.debug(f"Transcribed {len(audio_batch)} samples in {latency:.3f}s")
             return transcriptions, latency

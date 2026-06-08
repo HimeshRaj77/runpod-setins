@@ -20,6 +20,7 @@ class BatchItem:
     audio_data: np.ndarray
     sequence_number: int
     enqueued_at: float
+    is_final: bool = False
 
 
 class BatchManager:
@@ -57,6 +58,7 @@ class BatchManager:
                 audio_data=np.frombuffer(item.audio_data, dtype=np.int16),
                 sequence_number=item.sequence_number,
                 enqueued_at=item.timestamp,
+                is_final=getattr(item, 'is_final', False),
             )
             batch_items.append(batch_item)
 

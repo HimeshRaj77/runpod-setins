@@ -13,6 +13,9 @@ from websockets.asyncio.server import ServerConnection
 logger = logging.getLogger(__name__)
 
 
+from llm_engine import LLMEngine
+from tts_engine import TTSEngine
+
 @dataclass
 class LatencyStats:
     """Track latency statistics."""
@@ -51,6 +54,11 @@ class ConnectionState:
     # Audio state
     audio_buffer: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int16))
     buffer_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+    # Engines
+    llm_engine: LLMEngine = field(default_factory=LLMEngine)
+    tts_engine: TTSEngine = field(default_factory=TTSEngine)
+    llm_task: Optional[asyncio.Task] = None
 
     # Statistics
     audio_chunks_received: int = 0

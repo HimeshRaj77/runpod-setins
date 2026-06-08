@@ -17,6 +17,7 @@ class AudioItem:
     audio_data: bytes
     timestamp: float
     sequence_number: int
+    is_final: bool = False
 
     def age_seconds(self) -> float:
         """Get age of item in seconds."""
@@ -36,7 +37,7 @@ class AudioQueue:
         self.dropped_items = 0
         self.total_items = 0
 
-    async def enqueue(self, connection_id: str, audio_data: bytes) -> bool:
+    async def enqueue(self, connection_id: str, audio_data: bytes, is_final: bool = False) -> bool:
         """
         Enqueue audio data.
 
@@ -53,6 +54,7 @@ class AudioQueue:
                 audio_data=audio_data,
                 timestamp=time.time(),
                 sequence_number=seq,
+                is_final=is_final,
             )
 
             try:
