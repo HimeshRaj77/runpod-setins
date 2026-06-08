@@ -108,9 +108,6 @@ class WhisperEngine:
                     generate_kwargs={
                         "language": self.language if self.language != "auto" else None,
                         "task": self.task,
-                        "condition_on_prev_tokens": False,
-                        "compression_ratio_threshold": 1.35,
-                        "no_speech_threshold": 0.6,
                     },
                 )
             
