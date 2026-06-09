@@ -232,15 +232,9 @@ class WhisperEngine:
                         "language": self.language if self.language != "auto" else None,
                         "task": self.task,
                         # ── Anti-hallucination knobs ──────────────────────────
-                        # The single biggest source of Whisper hallucination:
-                        # conditioning on its own prior output causes looping.
-                        "condition_on_previous_text": False,
-                        # Suppress output when Whisper itself thinks there's no speech.
-                        "no_speech_threshold": self.no_speech_threshold,
-                        # Suppress overly repetitive/compressed outputs.
-                        "compression_ratio_threshold": self.compression_ratio_threshold,
+                        # In HuggingFace Transformers, this is called condition_on_prev_tokens
+                        "condition_on_prev_tokens": False,
                         # Greedy decoding — temperature=0 is deterministic & most accurate.
-                        # Never let the pipeline silently fall back to higher temperatures.
                         "temperature": 0.0,
                     },
                 )
