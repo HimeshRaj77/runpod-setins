@@ -3,6 +3,8 @@
 import asyncio
 import json
 import logging
+import struct
+import time
 from typing import Dict, Any
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -40,7 +42,69 @@ MIN_SPEECH_SEC        = 0.512    # 2 chunks
 
 # Hard cap fed to Whisper (its 30 s context window).
 MAX_UTTERANCE_SEC     = 30
+
+# ── 32-byte binary header sent by the frontend ────────────────────────────────
+# bytes  0-15  : session_id  (UUID as 16 raw Uint8 bytes)
+# bytes 16-19  : seq_num     (Uint32, little-endian)
+# bytes 20-27  : timestamp   (Float64, little-endian — Date.now() in ms)
+# bytes 28-31  : padding     (0x00)
+# bytes 32+    : Float32 PCM audio payload
+HEADER_SIZE = 32
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+def _parse_header(data: bytes) -> tuple[str, int, float, bytes]:
+    """
+    Strip the 32-byte binary header and return
+    (session_id_hex, seq_num, client_timestamp_ms, audio_payload).
+    Falls back gracefully if data is shorter than the header.
+    """
+    if len(data) < HEADER_SIZE:
+        return "", 0, 0.0, data
+    session_id = data[:16].hex()          # 16 bytes → 32-char hex string
+    seq_num    = struct.unpack_from("<I", data, 16)[0]   # Uint32 LE
+    timestamp  = struct.unpack_from("<d", data, 20)[0]   # Float64 LE
+    return session_id, seq_num, timestamp, data[HEADER_SIZE:]
+
+
+def _float32_to_int16(audio_bytes: bytes) -> np.ndarray:
+    """
+    Convert raw Float32 PCM bytes (values in [-1, 1]) to int16 samples.
+    The rest of the pipeline (VAD, Whisper) expects int16 at 16 kHz.
+    """
+    f32 = np.frombuffer(audio_bytes, dtype=np.float32)
+    f32 = np.clip(f32, -1.0, 1.0)
+    return (f32 * 32767).astype(np.int16)
+
+
+def _partial_delta(last_text: str, new_text: str) -> str:
+    """
+    Return only the words in `new_text` that extend beyond `last_text`.
+
+    Because Whisper re-transcribes a sliding window it often prepends the
+    same words from the previous partial. We walk forward through the new
+    result word-by-word and skip any prefix that matches the tail of what
+    we already sent, so the client only receives genuinely new content.
+
+    Example:
+        last = "Hello world"
+        new  = "Hello world how are you"
+        → delta = "how are you"
+    """
+    if not last_text:
+        return new_text
+
+    last_words = last_text.lower().split()
+    new_words  = new_text.split()
+
+    # Find the longest suffix of last_words that is a prefix of new_words
+    best_skip = 0
+    for length in range(1, min(len(last_words), len(new_words)) + 1):
+        if last_words[-length:] == [w.lower() for w in new_words[:length]]:
+            best_skip = length
+
+    delta_words = new_words[best_skip:]
+    return " ".join(delta_words)
 
 
 class STTServer:
@@ -122,9 +186,28 @@ class STTServer:
                         continue
 
                     if text:
+                        if is_final:
+                            # Final utterance — send the complete clean text and
+                            # reset the partial delta baseline for the next turn.
+                            send_text = text
+                            conn_state.last_partial_text = ""
+                        else:
+                            # Partial — Whisper re-transcribed the full sliding window,
+                            # so strip the prefix that was already sent to avoid the
+                            # client seeing the same words repeated on every fire.
+                            send_text = _partial_delta(conn_state.last_partial_text, text)
+                            if send_text:
+                                # Advance the baseline to include what we're about to send.
+                                conn_state.last_partial_text = (
+                                    (conn_state.last_partial_text + " " + send_text).strip()
+                                )
+                            else:
+                                # No new words — skip this partial entirely.
+                                continue
+
                         response = {
                             "status": "transcribed",
-                            "text": text,
+                            "text": send_text,
                             "is_final": is_final,
                             "latency_seconds": latency
                         }
@@ -230,6 +313,9 @@ class STTServer:
 
     async def handle_websocket(self, websocket: WebSocket):
         await websocket.accept()
+
+        # We use a placeholder conn_id until we receive the first chunk with
+        # a valid header (which gives us the real client session UUID).
         conn_id = str(id(websocket))
         conn_state = await self.registry.register(conn_id, websocket)
         logger.info(f"Worker connected: {conn_id}")
@@ -250,12 +336,43 @@ class STTServer:
 
         try:
             while True:
-                data = await websocket.receive_bytes()
+                raw = await websocket.receive_bytes()
                 conn_state.update_seen()
 
-                audio_int16 = np.frombuffer(data, dtype=np.int16)
+                # ── Parse 32-byte binary header ───────────────────────────────
+                session_id, seq_num, client_ts_ms, audio_bytes = _parse_header(raw)
 
-                # ── VAD ──────────────────────────────────────────────────────
+                # Store session ID on first packet
+                if session_id and not conn_state.client_session_id:
+                    conn_state.client_session_id = session_id
+                    logger.info(f"Session ID bound: {session_id} → {conn_id}")
+
+                # Drop duplicate or out-of-order packets using seq_num.
+                # seq_num wraps at 2^32; allow rollover by checking distance.
+                if seq_num != 0 and conn_state.last_seq_num >= 0:
+                    gap = (seq_num - conn_state.last_seq_num) & 0xFFFFFFFF
+                    if gap == 0:
+                        logger.debug(f"Duplicate packet seq={seq_num} dropped")
+                        continue
+                    if gap > 0x7FFFFFFF:  # wrapped backwards = out of order
+                        logger.warning(f"Out-of-order packet seq={seq_num} (last={conn_state.last_seq_num}) dropped")
+                        continue
+                conn_state.last_seq_num = seq_num
+
+                # ── Convert Float32 PCM → int16 ───────────────────────────────
+                # The frontend sends Float32Array (values in [-1, 1]).
+                # VAD and WhisperEngine both expect int16 @ 16 kHz.
+                audio_int16 = _float32_to_int16(audio_bytes)
+
+                if len(audio_int16) == 0:
+                    continue
+
+                # Measure end-to-end latency from client capture to server receipt
+                if client_ts_ms > 0:
+                    e2e_ms = (time.time() * 1000) - client_ts_ms
+                    logger.debug(f"E2E recv latency: {e2e_ms:.1f} ms (seq={seq_num})")
+
+                # ── VAD ───────────────────────────────────────────────────────
                 speech_int16, _ = self.vad_engine.detect_speech(audio_int16)
                 has_speech = len(speech_int16) > 0
 
@@ -265,6 +382,7 @@ class STTServer:
                     if not is_speaking:
                         is_speaking = True
                         samples_since_partial = 0
+                        conn_state.last_partial_text = ""  # reset delta baseline
 
                         # Only abort LLM/TTS if they are actually running
                         if conn_state.llm_is_active:
@@ -284,25 +402,22 @@ class STTServer:
                             speech_chunks.pop(0)
 
                     # ── Sliding-window partial STT ────────────────────────────
-                    # Fire every PARTIAL_SEND_EVERY new samples (~1.5 s),
-                    # but only if we have at least MIN_SPEECH_SAMPLES in the buffer.
                     total_samples = sum(len(c) for c in speech_chunks)
                     if (
                         samples_since_partial >= PARTIAL_SEND_EVERY
                         and total_samples     >= MIN_SPEECH_SAMPLES
                         and not self.audio_queue.is_full()
                     ):
-                        # Send only the last PARTIAL_WINDOW_SAMPLES
                         window = np.concatenate(speech_chunks)[-PARTIAL_WINDOW_SAMPLES:]
                         await self.audio_queue.enqueue(
                             conn_id,
                             window.tobytes(),
                             is_final=False
                         )
-                        samples_since_partial = 0   # reset counter after each send
+                        samples_since_partial = 0
 
                 else:
-                    # ── Silence ──────────────────────────────────────────────
+                    # ── Silence ───────────────────────────────────────────────
                     if is_speaking:
                         silence_samples += len(audio_int16)
 
@@ -330,9 +445,10 @@ class STTServer:
                             speech_chunks = []
                             silence_samples = 0
                             samples_since_partial = 0
+                            conn_state.last_partial_text = ""  # reset delta baseline
 
-                # Stats
-                conn_state.bytes_received += len(data)
+                # Stats (count audio samples, not raw bytes, for accuracy)
+                conn_state.bytes_received += len(raw)
                 conn_state.audio_chunks_received += 1
                 conn_state.audio_seconds_received += len(audio_int16) / sample_rate
 
@@ -344,6 +460,7 @@ class STTServer:
             conn_state.llm_engine.abort()
             conn_state.tts_engine.abort()
             await self.registry.unregister(conn_id)
+
 
     # ── metrics ──────────────────────────────────────────────────────────────
 

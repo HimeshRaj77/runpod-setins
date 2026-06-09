@@ -1,6 +1,7 @@
 """Whisper inference engine for speech-to-text transcription."""
 
 import logging
+import os
 import re
 import time
 from typing import List, Optional
@@ -28,7 +29,24 @@ MAX_NGRAM = 40
 
 # If the normalised text is shorter than this many chars, treat as too short.
 MIN_CHARS = 2
+
+# Pre-inference: minimum RMS energy below which we reject audio as silence/noise
+# without running Whisper at all. Saves GPU time and eliminates the most common
+# hallucination trigger. Tunable via env var.
+# 0.001 ~= -60 dBFS — captures genuine speech above background hiss.
+MIN_AUDIO_ENERGY = float(os.getenv("MIN_AUDIO_ENERGY", "0.001"))
+
+# Post-dedup: if the cleaned text has fewer words than this after loop truncation,
+# treat the whole thing as noise (e.g., orphaned "is" after deduplication).
+MIN_WORDS_AFTER_DEDUP = int(os.getenv("MIN_WORDS_AFTER_DEDUP", "2"))
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+def _audio_energy(audio_float: np.ndarray) -> float:
+    """Return RMS energy of a float32 audio array normalised to [-1, 1]."""
+    if len(audio_float) == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(audio_float ** 2)))
 
 
 def _normalize(text: str) -> str:
@@ -61,30 +79,31 @@ def _find_repeating_unit(words: list[str]) -> tuple[int, int]:
     """
     Generic n-gram loop detector.
 
-    Scans for the earliest position where a word window `words[0:w]`
-    starts repeating consecutively.  Returns (start_of_second_rep, window_size)
-    or (-1, -1) if no loop found.
-
-    Example:
-        words = ["What", "do", "you", "mean", "What", "do", "you", "mean", "What", ...]
-        → returns (4, 4)   # second occurrence starts at index 4, window=4 words
+    Scans for the earliest position where a word window of size `w`
+    starts repeating consecutively, at ANY starting offset.
+    Returns (start_of_second_rep, window_size) or (-1, -1) if no loop found.
     """
     n = len(words)
-    hi = min(MAX_NGRAM, n // (MIN_REPS_TO_TRUNCATE + 1))
+    # The max window size we can check is n // MIN_REPS_TO_TRUNCATE
+    hi = min(MAX_NGRAM, n // MIN_REPS_TO_TRUNCATE)
 
     for w in range(MIN_NGRAM, hi + 1):
-        pattern = words[:w]
-        # Find where the next occurrence begins
-        for start in range(w, n - w + 1):
-            if words[start : start + w] == pattern:
-                # Verify at least MIN_REPS_TO_TRUNCATE consecutive repetitions
-                reps = 1
-                pos  = start + w
-                while pos + w <= n and words[pos : pos + w] == pattern:
-                    reps += 1
-                    pos  += w
-                if reps >= MIN_REPS_TO_TRUNCATE:
-                    return start, w   # cut before second occurrence
+        # Slide a window across the text to find a repeating pattern
+        for offset in range(n - w * MIN_REPS_TO_TRUNCATE + 1):
+            pattern = words[offset : offset + w]
+            
+            # Check for consecutive repetitions
+            reps = 1
+            pos = offset + w
+            while pos + w <= n and words[pos : pos + w] == pattern:
+                reps += 1
+                pos += w
+                
+            if reps >= MIN_REPS_TO_TRUNCATE:
+                # We found a loop. Return the index where the SECOND repetition begins,
+                # so we can truncate everything from that point onwards.
+                return offset + w, w
+                
     return -1, -1
 
 
@@ -209,32 +228,51 @@ class WhisperEngine:
         audio_batch: List[np.ndarray],
         sample_rate: int = 16000,
     ) -> tuple[List[str], float]:
-        """
-        Transcribe a batch of int16 PCM arrays.
-
-        Returns:
-            (transcriptions, latency_seconds)
-        """
         start_time = time.time()
         try:
             if not audio_batch:
                 return [], 0.0
 
-            # int16 PCM → float32 [-1, 1]
-            audio_floats = [a.astype(np.float32) / 32768.0 for a in audio_batch]
+            # ── Layer 1: Pre-inference audio energy gate ──────────────────────
+            # If an audio chunk is below the minimum RMS energy threshold it is
+            # silence or background noise — skip Whisper entirely for that chunk.
+            # This is the primary hallucination prevention: never feed bad audio
+            # to the model in the first place.
+            audio_floats: list[np.ndarray] = []
+            energy_mask: list[bool] = []   # True = passed energy gate
 
+            for a in audio_batch:
+                f = a.astype(np.float32) / 32768.0
+                if _audio_energy(f) < MIN_AUDIO_ENERGY:
+                    logger.debug("[whisper] chunk below energy threshold — skipped")
+                    energy_mask.append(False)
+                else:
+                    audio_floats.append(f)
+                    energy_mask.append(True)
+
+            # If every chunk was silence, return early without touching the GPU.
+            if not audio_floats:
+                latency = time.time() - start_time
+                return ["" for _ in audio_batch], latency
+
+            # ── Layer 2: Inference-time anti-hallucination ────────────────────
+            # no_speech_threshold and compression_ratio_threshold are pipeline-level
+            # arguments in HuggingFace — they MUST be passed to self.pipe() directly,
+            # not inside generate_kwargs. Passing them in generate_kwargs causes the
+            # "unused model_kwargs" error and they have zero effect.
             with torch.no_grad():
                 results = self.pipe(
                     audio_floats,
                     batch_size=len(audio_floats),
+                    no_speech_threshold=self.no_speech_threshold,
+                    compression_ratio_threshold=self.compression_ratio_threshold,
                     generate_kwargs={
-                        # Pin language/task
                         "language": self.language if self.language != "auto" else None,
                         "task": self.task,
-                        # ── Anti-hallucination knobs ──────────────────────────
-                        # In HuggingFace Transformers, this is called condition_on_prev_tokens
+                        # condition_on_prev_tokens=False: prevent the decoder from
+                        # conditioning on its own prior output — the #1 cause of loops.
                         "condition_on_prev_tokens": False,
-                        # Greedy decoding — temperature=0 is deterministic & most accurate.
+                        # temperature=0 → greedy decoding, most deterministic output.
                         "temperature": 0.0,
                     },
                 )
@@ -242,24 +280,45 @@ class WhisperEngine:
             if isinstance(results, dict):
                 results = [results]
 
-            transcriptions: list[str] = []
+            # ── Layer 3: Post-inference cleanup ───────────────────────────────
+            transcriptions_active: list[str] = []
             for res in results:
                 raw = res.get("text", "").strip()
 
-                # ── 1. pure-noise / silence hallucination gate ────────────────
+                # 3a. Pure-noise / silence hallucination token gate
                 if _is_noise_hallucination(raw):
                     logger.debug(f"[whisper] noise-hallucination dropped: '{raw}'")
-                    transcriptions.append("")
+                    transcriptions_active.append("")
                     continue
 
-                # ── 2. generic repetition deduplication ──────────────────────
+                # 3b. Generic repetition deduplication (sliding window n-gram)
                 cleaned = _deduplicate(raw)
-                transcriptions.append(cleaned)
+
+                # 3c. Post-dedup orphan word check.
+                # When a large loop is removed (e.g. "is It's a day-to-day × 49")
+                # the leftover prefix ("is") is too short to be real content.
+                # Only drop if the original was much longer — avoids penalising
+                # genuine short responses.
+                if (len(cleaned.split()) < MIN_WORDS_AFTER_DEDUP
+                        and len(raw.split()) >= MIN_WORDS_AFTER_DEDUP):
+                    logger.debug(
+                        f"[whisper] orphan after dedup dropped: '{cleaned}' "
+                        f"(original: '{raw[:80]}')"
+                    )
+                    transcriptions_active.append("")
+                    continue
+
+                transcriptions_active.append(cleaned)
+
+            # Reconstruct full-length list aligned with original audio_batch,
+            # inserting "" for any chunks that were skipped by the energy gate.
+            transcriptions: list[str] = []
+            active_iter = iter(transcriptions_active)
+            for passed in energy_mask:
+                transcriptions.append(next(active_iter) if passed else "")
 
             latency = time.time() - start_time
-            logger.debug(
-                f"[whisper] {len(audio_batch)} item(s) → {latency:.3f}s"
-            )
+            logger.debug(f"[whisper] {len(audio_batch)} item(s) → {latency:.3f}s")
             return transcriptions, latency
 
         except Exception as e:

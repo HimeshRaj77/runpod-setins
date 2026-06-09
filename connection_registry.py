@@ -61,6 +61,14 @@ class ConnectionState:
     llm_task: Optional[asyncio.Task] = None
     llm_is_active: bool = False   # True while LLM+TTS are generating a response
 
+    # Packet ordering / deduplication (driven by the 32-byte header seq_num)
+    last_seq_num: int = -1          # last successfully processed sequence number
+    client_session_id: str = ""     # UUID from header bytes 0-15
+
+    # Partial transcript deduplication — track the last partial we sent so we
+    # can emit only the NEW suffix on each sliding-window fire.
+    last_partial_text: str = ""
+
     # Statistics
     audio_chunks_received: int = 0
     audio_seconds_received: float = 0.0
