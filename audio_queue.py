@@ -82,13 +82,9 @@ class AudioQueue:
         """
         Dequeue a batch of audio items.
 
-        Args:
-            max_batch_size: Maximum number of items in batch
-            wait_ms: Maximum time to wait for batch to fill (milliseconds)
-            timeout: Overall timeout for operation
-
-        Returns:
-            List of audio items (may be smaller than max_batch_size)
+        Final (is_final=True) items get an express lane — they skip the batch
+        wait entirely so Whisper fires immediately after the user stops speaking,
+        saving up to MAX_BATCH_WAIT_MS per utterance.
         """
         batch = []
         wait_seconds = wait_ms / 1000.0
@@ -98,7 +94,13 @@ class AudioQueue:
             first_item = await asyncio.wait_for(self.queue.get(), timeout=timeout)
             batch.append(first_item)
 
-            # Try to collect more items up to max_batch_size or wait_ms
+            # ── Express lane for finals ───────────────────────────────────────
+            # A final item means the user just finished speaking. Process it
+            # immediately — do NOT wait for more items to fill a batch.
+            if first_item.is_final:
+                return batch
+
+            # ── Partial items: collect a batch to amortise GPU overhead ───────
             start = time.time()
             while len(batch) < max_batch_size and (time.time() - start) < wait_seconds:
                 try:
@@ -106,6 +108,9 @@ class AudioQueue:
                         self.queue.get(), timeout=(wait_seconds - (time.time() - start))
                     )
                     batch.append(item)
+                    # If we hit a final mid-batch, stop collecting and return now.
+                    if item.is_final:
+                        break
                 except asyncio.TimeoutError:
                     break
 
