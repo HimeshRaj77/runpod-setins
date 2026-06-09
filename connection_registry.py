@@ -59,6 +59,7 @@ class ConnectionState:
     llm_engine: LLMEngine = field(default_factory=LLMEngine)
     tts_engine: TTSEngine = field(default_factory=TTSEngine)
     llm_task: Optional[asyncio.Task] = None
+    llm_is_active: bool = False   # True while LLM+TTS are generating a response
 
     # Statistics
     audio_chunks_received: int = 0

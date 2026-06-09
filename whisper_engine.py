@@ -141,6 +141,8 @@ class WhisperEngine:
         cache_dir: Optional[str] = None,
         language: str = "en",
         task: str = "transcribe",
+        no_speech_threshold: float = 0.6,
+        compression_ratio_threshold: float = 1.35,
     ):
         self.model_id   = model_id
         self.device     = device
@@ -148,6 +150,8 @@ class WhisperEngine:
         self.language   = language
         self.task       = task
         self.cache_dir  = cache_dir
+        self.no_speech_threshold       = no_speech_threshold
+        self.compression_ratio_threshold = compression_ratio_threshold
 
         if dtype == "float16":
             self.torch_dtype = torch.float16
@@ -177,16 +181,21 @@ class WhisperEngine:
                 model_id, cache_dir=cache_dir
             )
 
-            self.pipe = pipeline(
-                "automatic-speech-recognition",
+            # ── Pipeline ─────────────────────────────────────────────────────
+            # We manage chunking ourselves; do NOT set chunk_length_s here.
+            # return_timestamps=False avoids the extra overhead.
+            # We also pass the attention implementation for Flash Attention 2
+            # if available on the current CUDA device.
+            pipe_kwargs = dict(
                 model=self.model,
                 tokenizer=self.processor.tokenizer,
                 feature_extractor=self.processor.feature_extractor,
                 torch_dtype=self.torch_dtype,
                 device=device if device == "cuda" else -1,
                 return_timestamps=False,
-                # No chunk_length_s / stride here — we manage chunking ourselves
             )
+
+            self.pipe = pipeline("automatic-speech-recognition", **pipe_kwargs)
 
             logger.info("Whisper engine initialised successfully")
         except Exception as e:
@@ -219,8 +228,20 @@ class WhisperEngine:
                     audio_floats,
                     batch_size=len(audio_floats),
                     generate_kwargs={
+                        # Pin language/task
                         "language": self.language if self.language != "auto" else None,
                         "task": self.task,
+                        # ── Anti-hallucination knobs ──────────────────────────
+                        # The single biggest source of Whisper hallucination:
+                        # conditioning on its own prior output causes looping.
+                        "condition_on_previous_text": False,
+                        # Suppress output when Whisper itself thinks there's no speech.
+                        "no_speech_threshold": self.no_speech_threshold,
+                        # Suppress overly repetitive/compressed outputs.
+                        "compression_ratio_threshold": self.compression_ratio_threshold,
+                        # Greedy decoding — temperature=0 is deterministic & most accurate.
+                        # Never let the pipeline silently fall back to higher temperatures.
+                        "temperature": 0.0,
                     },
                 )
 

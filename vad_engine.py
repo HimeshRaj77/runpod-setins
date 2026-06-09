@@ -72,8 +72,8 @@ class VadEngine:
             # Convert int16 to float32
             audio_float = audio.astype(np.float32) / 32768.0
 
-            # Convert to torch tensor
-            audio_tensor = torch.from_numpy(audio_float).unsqueeze(0)
+            # Silero get_speech_timestamps expects a 1-D tensor (N,)
+            audio_tensor = torch.from_numpy(audio_float)
 
             if self.device == "cuda":
                 audio_tensor = audio_tensor.cuda()
@@ -83,6 +83,7 @@ class VadEngine:
                 audio_tensor,
                 self.model,
                 threshold=self.threshold,
+                sampling_rate=self.sample_rate,
                 return_seconds=False,
                 visualize_probs=False,
             )
@@ -132,15 +133,15 @@ class VadEngine:
             # Convert to float32
             audio_float = audio.astype(np.float32) / 32768.0
 
-            # Convert to torch tensor
+            # Model requires a (1, N) tensor and the sample_rate
             audio_tensor = torch.from_numpy(audio_float).unsqueeze(0)
 
             if self.device == "cuda":
                 audio_tensor = audio_tensor.cuda()
 
-            # Get speech probability (requires ONNX model with prob output)
+            # Get speech probability
             with torch.no_grad():
-                prob = self.model(audio_tensor).item()
+                prob = self.model(audio_tensor, self.sample_rate).item()
 
             return prob
 

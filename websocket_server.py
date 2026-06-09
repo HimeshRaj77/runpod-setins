@@ -66,7 +66,9 @@ class STTServer:
             dtype=config.DTYPE,
             cache_dir=config.WHISPER_CACHE_DIR,
             language=config.WHISPER_LANGUAGE,
-            task=config.WHISPER_TASK
+            task=config.WHISPER_TASK,
+            no_speech_threshold=config.WHISPER_NO_SPEECH_THRESHOLD,
+            compression_ratio_threshold=config.WHISPER_COMPRESSION_RATIO_THRESHOLD,
         )
         self.worker_task = None
         self.is_running = False
@@ -142,9 +144,6 @@ class STTServer:
                     # ── LLM only fires on the FINAL utterance ────────────────
                     if is_final and text:
                         await self.run_llm_pipeline(conn_state, text)
-                        # Mark LLM active so next speech is correctly identified
-                        # as a barge-in (registry does not track this, conn_state does)
-                        conn_state.llm_task  # keep reference
 
             except asyncio.CancelledError:
                 break
@@ -167,47 +166,65 @@ class STTServer:
             except asyncio.CancelledError:
                 pass
 
-        def on_sentence(sentence):
-            asyncio.create_task(self.run_tts_for_sentence(conn_state, sentence))
-
-        def on_token(token):
-            async def _send():
-                try:
-                    await conn_state.websocket.send_json({
-                        "status": "llm_token",
-                        "text": token
-                    })
-                except Exception as e:
-                    logger.error(f"Error sending LLM token: {e}")
-            asyncio.create_task(_send())
-
         async def _llm_job():
             try:
                 conn_state.llm_engine._current_task = asyncio.current_task()
-                full_text = await conn_state.llm_engine.generate_response(
-                    text, on_sentence, on_token
-                )
+                
+                token_queue = asyncio.Queue()
+                tts_task = None
+                
+                async def token_stream():
+                    while True:
+                        token = await token_queue.get()
+                        if token is None:
+                            break
+                        yield token
+
+                async def _tts_worker():
+                    try:
+                        async for audio_chunk in conn_state.tts_engine.generate_audio(token_stream()):
+                            await conn_state.websocket.send_bytes(audio_chunk)
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception as e:
+                        logger.error(f"TTS Error: {e}")
+                        
+                tts_task = asyncio.create_task(_tts_worker())
+                conn_state.llm_is_active = True
+                
+                full_text = ""
+                async for token in conn_state.llm_engine.generate_response(text):
+                    full_text += token
+                    
+                    try:
+                        await conn_state.websocket.send_json({
+                            "status": "llm_token",
+                            "text": token
+                        })
+                    except Exception as e:
+                        logger.error(f"Error sending LLM token: {e}")
+                        
+                    await token_queue.put(token)
+                    
+                await token_queue.put(None)
+                if tts_task:
+                    await tts_task
+                
                 logger.info(f"LLM final output ({len(full_text)} chars)")
                 await conn_state.websocket.send_json({
                     "status": "llm_final",
                     "text": full_text
                 })
             except asyncio.CancelledError:
-                pass
+                # Cancel TTS too so it doesn't keep sending stale audio
+                if tts_task and not tts_task.done():
+                    tts_task.cancel()
             except Exception as e:
                 logger.error(f"LLM Error: {e}")
+            finally:
+                conn_state.llm_is_active = False
 
         conn_state.llm_task = asyncio.create_task(_llm_job())
-
-    async def run_tts_for_sentence(self, conn_state, sentence: str):
-        """Stream TTS audio chunks back to the client."""
-        try:
-            async for audio_chunk in conn_state.tts_engine.generate_audio(sentence):
-                await conn_state.websocket.send_bytes(audio_chunk)
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.error(f"TTS Error: {e}")
 
     # ── WebSocket handler ────────────────────────────────────────────────────
 
@@ -223,7 +240,6 @@ class STTServer:
         speech_chunks: list[np.ndarray] = []  # accumulated speech samples
         silence_samples: int  = 0
         is_speaking: bool     = False
-        llm_is_active: bool   = False         # True once LLM started this turn
         samples_since_partial: int = 0        # new-speech samples since last partial
 
         PARTIAL_WINDOW_SAMPLES    = int(PARTIAL_WINDOW_SEC     * sample_rate)
@@ -251,7 +267,7 @@ class STTServer:
                         samples_since_partial = 0
 
                         # Only abort LLM/TTS if they are actually running
-                        if llm_is_active:
+                        if conn_state.llm_is_active:
                             conn_state.llm_engine.abort()
                             conn_state.tts_engine.abort()
                             logger.info(f"Barge-in: {conn_id} — interrupted active response")

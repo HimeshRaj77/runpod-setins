@@ -50,6 +50,12 @@ class Config:
     WHISPER_LANGUAGE: str = os.getenv("WHISPER_LANGUAGE", "en")
     WHISPER_TASK: str = os.getenv("WHISPER_TASK", "transcribe")  # transcribe or translate
 
+    # Whisper Accuracy / Anti-hallucination Knobs
+    # no_speech_threshold: suppress output when Whisper's own no-speech prob exceeds this.
+    WHISPER_NO_SPEECH_THRESHOLD: float = float(os.getenv("WHISPER_NO_SPEECH_THRESHOLD", "0.6"))
+    # compression_ratio_threshold: suppress output that is overly repetitive/compressed.
+    WHISPER_COMPRESSION_RATIO_THRESHOLD: float = float(os.getenv("WHISPER_COMPRESSION_RATIO_THRESHOLD", "1.35"))
+
     # Backpressure
     ENABLE_BACKPRESSURE: bool = os.getenv("ENABLE_BACKPRESSURE", "true").lower() == "true"
     BACKPRESSURE_THRESHOLD: float = float(os.getenv("BACKPRESSURE_THRESHOLD", "0.9"))

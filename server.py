@@ -50,4 +50,14 @@ async def websocket_endpoint(websocket: WebSocket):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("server:app", host=config.HOST, port=config.PORT, reload=False)
+    uvicorn.run(
+        "server:app",
+        host=config.HOST,
+        port=config.PORT,
+        reload=False,
+        # Send a WebSocket ping frame every 20 s.
+        # This keeps the RunPod proxy tunnel alive and prevents the
+        # proxy from treating the connection as idle and closing it.
+        ws_ping_interval=20,   # seconds between pings
+        ws_ping_timeout=30,    # seconds to wait for pong before closing
+    )
