@@ -53,28 +53,68 @@ HEADER_SIZE = 32
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def _parse_header(data: bytes) -> tuple[str, int, float, bytes]:
-    """
-    Strip the 32-byte binary header and return
-    (session_id_hex, seq_num, client_timestamp_ms, audio_payload).
-    Falls back gracefully if data is shorter than the header.
-    """
-    if len(data) < HEADER_SIZE:
-        return "", 0, 0.0, data
-    session_id = data[:16].hex()          # 16 bytes → 32-char hex string
-    seq_num    = struct.unpack_from("<I", data, 16)[0]   # Uint32 LE
-    timestamp  = struct.unpack_from("<d", data, 20)[0]   # Float64 LE
-    return session_id, seq_num, timestamp, data[HEADER_SIZE:]
-
 
 def _float32_to_int16(audio_bytes: bytes) -> np.ndarray:
     """
     Convert raw Float32 PCM bytes (values in [-1, 1]) to int16 samples.
     The rest of the pipeline (VAD, Whisper) expects int16 at 16 kHz.
+
+    Sanitizes NaN / Inf before converting — these appear when the microphone
+    buffer hasn't fully initialised or when the OS returns a malformed chunk.
     """
-    f32 = np.frombuffer(audio_bytes, dtype=np.float32)
+    if len(audio_bytes) == 0 or len(audio_bytes) % 4 != 0:
+        return np.array([], dtype=np.int16)
+    f32 = np.frombuffer(audio_bytes, dtype=np.float32).copy()
+    # Replace NaN and Inf with 0 / ±1 before any arithmetic
+    f32 = np.nan_to_num(f32, nan=0.0, posinf=1.0, neginf=-1.0)
     f32 = np.clip(f32, -1.0, 1.0)
     return (f32 * 32767).astype(np.int16)
+
+
+def _is_utf16_session_id(header_bytes: bytes) -> bool:
+    """
+    Detect if the session ID field (bytes 0-15) looks like a UTF-16 LE
+    encoded string — i.e. every odd byte is 0x00.  This happens when the
+    frontend encodes the UUID as a JS string instead of a Uint8Array.
+    """
+    if len(header_bytes) < 16:
+        return False
+    odd_bytes = header_bytes[1:16:2]   # bytes at positions 1,3,5,...,15
+    return all(b == 0 for b in odd_bytes)
+
+
+def _parse_header(data: bytes) -> tuple[str, int, float, bytes]:
+    """
+    Strip the 32-byte binary header and return
+    (session_id_hex, seq_num, client_timestamp_ms, audio_payload).
+
+    Handles three cases:
+      1. Correct binary header  → parse normally
+      2. UTF-16 session ID      → log warning, still parse seq/ts correctly
+      3. No header / too short  → treat entire payload as legacy int16 audio
+    """
+    if len(data) < HEADER_SIZE:
+        # Legacy client — no header, entire payload is audio
+        return "", 0, 0.0, data
+
+    if _is_utf16_session_id(data[:16]):
+        # Frontend encoded the UUID as a UTF-16 string — extract whatever we
+        # can and log once so the frontend team can fix it.
+        logger.warning(
+            "Header session_id appears UTF-16 encoded. "
+            "Frontend should send UUID as a Uint8Array of raw bytes, not a string."
+        )
+        # The seq_num and timestamp fields start at byte 16 so they are
+        # unaffected by the UTF-16 encoding of bytes 0–15.
+        session_id = data[:16].hex() + "_utf16"
+        seq_num   = struct.unpack_from("<I", data, 16)[0]
+        timestamp = struct.unpack_from("<d", data, 20)[0]
+        return session_id, seq_num, timestamp, data[HEADER_SIZE:]
+
+    session_id = data[:16].hex()
+    seq_num    = struct.unpack_from("<I", data, 16)[0]
+    timestamp  = struct.unpack_from("<d", data, 20)[0]
+    return session_id, seq_num, timestamp, data[HEADER_SIZE:]
 
 
 def _partial_delta(last_text: str, new_text: str) -> str:
@@ -105,6 +145,7 @@ def _partial_delta(last_text: str, new_text: str) -> str:
 
     delta_words = new_words[best_skip:]
     return " ".join(delta_words)
+
 
 
 class STTServer:
