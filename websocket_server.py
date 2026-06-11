@@ -92,6 +92,10 @@ def _is_utf16_session_id(header_bytes: bytes) -> bool:
     """
     if len(header_bytes) < 16:
         return False
+    # If the session ID is completely all zeros, it is a valid binary zero-UUID,
+    # not a UTF-16 encoded string.
+    if all(b == 0 for b in header_bytes):
+        return False
     odd_bytes = header_bytes[1:16:2]   # bytes at positions 1,3,5,...,15
     return all(b == 0 for b in odd_bytes)
 
@@ -120,13 +124,15 @@ def _parse_header(data: bytes) -> tuple[str, int, float, bytes]:
         # The seq_num and timestamp fields start at byte 16 so they are
         # unaffected by the UTF-16 encoding of bytes 0–15.
         session_id = data[:16].hex() + "_utf16"
-        seq_num   = struct.unpack_from("<I", data, 16)[0]
-        timestamp = struct.unpack_from("<d", data, 20)[0]
+        # Parse fields as Big Endian as specified in runpod_api_implementation_details.md
+        seq_num   = struct.unpack_from(">I", data, 16)[0]
+        timestamp = struct.unpack_from(">d", data, 20)[0]
         return session_id, seq_num, timestamp, data[HEADER_SIZE:]
 
     session_id = data[:16].hex()
-    seq_num    = struct.unpack_from("<I", data, 16)[0]
-    timestamp  = struct.unpack_from("<d", data, 20)[0]
+    # Parse fields as Big Endian as specified in runpod_api_implementation_details.md
+    seq_num    = struct.unpack_from(">I", data, 16)[0]
+    timestamp  = struct.unpack_from(">d", data, 20)[0]
     return session_id, seq_num, timestamp, data[HEADER_SIZE:]
 
 
