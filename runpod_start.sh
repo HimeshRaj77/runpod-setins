@@ -26,6 +26,16 @@ read -p "Enter the port to run the server on [8000]: " INPUT_PORT
 PORT=${INPUT_PORT:-8000}
 export PORT=$PORT
 
+# Ask for LLM Provider
+read -p "Which LLM Provider do you want to use? (ollama/groq) [ollama]: " INPUT_PROVIDER
+PROVIDER=${INPUT_PROVIDER:-ollama}
+export LLM_PROVIDER=$PROVIDER
+
+if [ "$PROVIDER" = "groq" ]; then
+    read -p "Enter your GROQ_API_KEY: " INPUT_GROQ_KEY
+    export GROQ_API_KEY=$INPUT_GROQ_KEY
+fi
+
 # uvicorn with worker count from env or config
 WORKERS=${WORKERS:-1}
 

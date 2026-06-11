@@ -60,6 +60,11 @@ class Config:
     ENABLE_BACKPRESSURE: bool = os.getenv("ENABLE_BACKPRESSURE", "true").lower() == "true"
     BACKPRESSURE_THRESHOLD: float = float(os.getenv("BACKPRESSURE_THRESHOLD", "0.9"))
 
+    # LLM Settings
+    LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "ollama")
+    GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
+    GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+
     # Logging
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
     LOG_FORMAT: str = os.getenv("LOG_FORMAT", "json")

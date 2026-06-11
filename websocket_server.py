@@ -423,8 +423,6 @@ class STTServer:
         conn_state.llm_task = asyncio.create_task(_llm_job())
         logger.info(f"[run_llm_pipeline] [{conn_id}] LLM job task created and running in background.")
 
-        conn_state.llm_task = asyncio.create_task(_llm_job())
-
     # ── WebSocket handler ────────────────────────────────────────────────────
 
     async def handle_websocket(self, websocket: WebSocket):
@@ -466,31 +464,67 @@ class STTServer:
                 raw = message["bytes"]
                 conn_state.update_seen()
 
-                # ── Parse 32-byte binary header ───────────────────────────────
-                session_id, seq_num, client_ts_ms, audio_bytes = _parse_header(raw)
-                logger.info(f"[{conn_id}] Recv raw={len(raw)} bytes, header_hex={raw[:32].hex()}, seq={seq_num}, client_ts={client_ts_ms}")
+                # ── Auto-detect header existence on first packet ────────────────
+                if conn_state.audio_chunks_received == 0:
+                    client_session_id = (
+                        websocket.query_params.get("device_session_id")
+                        or websocket.query_params.get("session_id")
+                        or websocket.query_params.get("api_key")
+                    )
+                    
+                    if client_session_id:
+                        conn_state.expect_header = False
+                        conn_state.audio_format = "int16"
+                        conn_state.client_session_id = client_session_id
+                        logger.info(f"[{conn_id}] Query parameters found. Session ID: {client_session_id}. Using raw Int16 format (no header).")
+                    else:
+                        # Inspect the bytes to see if it's a valid header
+                        session_id, seq_num, client_ts_ms, _ = _parse_header(raw)
+                        # A valid timestamp in ms should be within [1e12, 2e12] (years 2001 to 2033)
+                        # A valid sequence number on the first packet should be small (e.g. <= 100)
+                        if 1e12 <= client_ts_ms <= 2e12 and seq_num <= 100:
+                            conn_state.expect_header = True
+                            conn_state.audio_format = "float32"
+                            logger.info(f"[{conn_id}] Valid header detected (seq={seq_num}, ts={client_ts_ms}). Using Float32 format with header.")
+                        else:
+                            conn_state.expect_header = False
+                            conn_state.audio_format = "int16"
+                            conn_state.client_session_id = f"session_{conn_id}"
+                            logger.info(f"[{conn_id}] Header validation failed (parsed seq={seq_num}, ts={client_ts_ms}). Falling back to raw Int16 format (no header).")
 
-                # Store session ID on first packet
-                if session_id and not conn_state.client_session_id:
-                    conn_state.client_session_id = session_id
-                    logger.info(f"Session ID bound: {session_id} → {conn_id}")
+                # ── Parse binary header if expected ─────────────────────────────
+                if conn_state.expect_header:
+                    session_id, seq_num, client_ts_ms, audio_bytes = _parse_header(raw)
+                    logger.info(f"[{conn_id}] Recv raw={len(raw)} bytes, header_hex={raw[:32].hex()}, seq={seq_num}, client_ts={client_ts_ms}")
+                    
+                    # Store session ID on first packet
+                    if session_id and not conn_state.client_session_id:
+                        conn_state.client_session_id = session_id
+                        logger.info(f"Session ID bound: {session_id} → {conn_id}")
 
-                # Drop duplicate or out-of-order packets using seq_num.
-                # seq_num wraps at 2^32; allow rollover by checking distance.
-                if seq_num != 0 and conn_state.last_seq_num >= 0:
-                    gap = (seq_num - conn_state.last_seq_num) & 0xFFFFFFFF
-                    if gap == 0:
-                        logger.info(f"[{conn_id}] Duplicate packet seq={seq_num} dropped")
-                        continue
-                    if gap > 0x7FFFFFFF:  # wrapped backwards = out of order
-                        logger.warning(f"[{conn_id}] Out-of-order packet seq={seq_num} (last={conn_state.last_seq_num}) dropped")
-                        continue
-                conn_state.last_seq_num = seq_num
+                    # Drop duplicate or out-of-order packets using seq_num.
+                    # seq_num wraps at 2^32; allow rollover by checking distance.
+                    if seq_num != 0 and conn_state.last_seq_num >= 0:
+                        gap = (seq_num - conn_state.last_seq_num) & 0xFFFFFFFF
+                        if gap == 0:
+                            logger.info(f"[{conn_id}] Duplicate packet seq={seq_num} dropped")
+                            continue
+                        if gap > 0x7FFFFFFF:  # wrapped backwards = out of order
+                            logger.warning(f"[{conn_id}] Out-of-order packet seq={seq_num} (last={conn_state.last_seq_num}) dropped")
+                            continue
+                    conn_state.last_seq_num = seq_num
+                else:
+                    session_id = conn_state.client_session_id
+                    seq_num = 0
+                    client_ts_ms = 0.0
+                    audio_bytes = raw
+                    logger.info(f"[{conn_id}] Recv raw={len(raw)} bytes (raw Int16 audio, no header)")
 
-                # ── Convert Float32 PCM → int16 ───────────────────────────────
-                # The frontend sends Float32Array (values in [-1, 1]).
-                # VAD and WhisperEngine both expect int16 @ 16 kHz.
-                audio_int16 = _float32_to_int16(audio_bytes)
+                # ── Convert PCM ───────────────────────────────────────────────
+                if conn_state.audio_format == "float32":
+                    audio_int16 = _float32_to_int16(audio_bytes)
+                else:
+                    audio_int16 = np.frombuffer(audio_bytes, dtype=np.int16).copy()
 
                 if len(audio_int16) == 0:
                     logger.info(f"[{conn_id}] Converted int16 audio array is empty. Skipping.")

@@ -64,6 +64,8 @@ class ConnectionState:
     # Packet ordering / deduplication (driven by the 32-byte header seq_num)
     last_seq_num: int = -1          # last successfully processed sequence number
     client_session_id: str = ""     # UUID from header bytes 0-15
+    expect_header: bool = True      # Whether we expect a 32-byte header
+    audio_format: str = "float32"   # Audio format: "float32" or "int16"
 
     # Partial transcript deduplication — track the last partial we sent so we
     # can emit only the NEW suffix on each sliding-window fire.
