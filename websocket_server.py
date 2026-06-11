@@ -43,6 +43,19 @@ MIN_SPEECH_SEC        = 0.512    # 2 chunks
 # Hard cap fed to Whisper (its 30 s context window).
 MAX_UTTERANCE_SEC     = 30
 
+# Pre-inference: minimum RMS energy below which we reject audio as silence/noise
+# without running Whisper at all. Saves GPU time and eliminates the most common
+# hallucination trigger. Tunable via env var.
+# 0.001 ~= -60 dBFS — captures genuine speech above background hiss.
+import os
+MIN_AUDIO_ENERGY = float(os.getenv("MIN_AUDIO_ENERGY", "0.001"))
+
+def _audio_energy(audio_float: np.ndarray) -> float:
+    """Return RMS energy of a float32 audio array normalised to [-1, 1]."""
+    if len(audio_float) == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(audio_float ** 2)))
+
 # ── 32-byte binary header sent by the frontend ────────────────────────────────
 # bytes  0-15  : session_id  (UUID as 16 raw Uint8 bytes)
 # bytes 16-19  : seq_num     (Uint32, little-endian)
