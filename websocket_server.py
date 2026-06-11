@@ -260,6 +260,7 @@ class STTServer:
                             self.total_audio_seconds += (
                                 len(batch_item.audio_data) / self.config.SAMPLE_RATE
                             )
+                            logger.info(f"Transcribe Hit #{self.total_transcripts} | Conn: {conn_id} | Latency: {latency:.3f}s | Final: {is_final} | Text Length: {len(send_text)}")
                         except Exception as e:
                             logger.error(f"Failed to send transcript to {conn_id}: {e}")
                             await self.registry.unregister(conn_id)
@@ -292,6 +293,7 @@ class STTServer:
 
         async def _llm_job():
             try:
+                llm_start_time = time.time()
                 conn_state.llm_engine._current_task = asyncio.current_task()
                 
                 token_queue = asyncio.Queue()
@@ -334,7 +336,9 @@ class STTServer:
                 if tts_task:
                     await tts_task
                 
-                logger.info(f"LLM final output ({len(full_text)} chars)")
+                reply_latency = time.time() - llm_start_time
+                logger.info(f"LLM Reply completed | Final output length: {len(full_text)} chars | Reply Latency: {reply_latency:.3f}s")
+                
                 await conn_state.websocket.send_json({
                     "status": "llm_final",
                     "text": full_text
