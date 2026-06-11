@@ -231,7 +231,10 @@ class WhisperEngine:
         start_time = time.time()
         try:
             if not audio_batch:
+                logger.info("[whisper] empty audio batch received")
                 return [], 0.0
+
+            logger.info(f"[whisper] transcribing batch of {len(audio_batch)} audio chunk(s)")
 
             # ── Layer 1: Pre-inference audio energy gate ──────────────────────
             # If an audio chunk is below the minimum RMS energy threshold it is
@@ -241,18 +244,21 @@ class WhisperEngine:
             audio_floats: list[np.ndarray] = []
             energy_mask: list[bool] = []   # True = passed energy gate
 
-            for a in audio_batch:
+            for idx, a in enumerate(audio_batch):
                 f = a.astype(np.float32) / 32768.0
-                if _audio_energy(f) < MIN_AUDIO_ENERGY:
-                    logger.debug("[whisper] chunk below energy threshold — skipped")
+                energy = _audio_energy(f)
+                if energy < MIN_AUDIO_ENERGY:
+                    logger.info(f"[whisper] chunk {idx} below energy threshold (energy={energy:.6f} < {MIN_AUDIO_ENERGY}) — skipped")
                     energy_mask.append(False)
                 else:
+                    logger.info(f"[whisper] chunk {idx} passed energy gate (energy={energy:.6f} >= {MIN_AUDIO_ENERGY})")
                     audio_floats.append(f)
                     energy_mask.append(True)
 
             # If every chunk was silence, return early without touching the GPU.
             if not audio_floats:
                 latency = time.time() - start_time
+                logger.info(f"[whisper] all chunks skipped by energy gate. returning empty. latency: {latency:.3f}s")
                 return ["" for _ in audio_batch], latency
 
             # ── Layer 2: Inference-time anti-hallucination ────────────────────
@@ -260,6 +266,8 @@ class WhisperEngine:
             # arguments in HuggingFace — they MUST be passed to self.pipe() directly,
             # not inside generate_kwargs. Passing them in generate_kwargs causes the
             # "unused model_kwargs" error and they have zero effect.
+            logger.info(f"[whisper] Running pipeline inference on {len(audio_floats)} active chunks...")
+            infer_start = time.time()
             with torch.no_grad():
                 results = self.pipe(
                     audio_floats,
@@ -276,23 +284,27 @@ class WhisperEngine:
                         "temperature": 0.0,
                     },
                 )
+            infer_time = time.time() - infer_start
+            logger.info(f"[whisper] pipeline inference completed in {infer_time:.3f}s")
 
             if isinstance(results, dict):
                 results = [results]
 
             # ── Layer 3: Post-inference cleanup ───────────────────────────────
             transcriptions_active: list[str] = []
-            for res in results:
+            for idx, res in enumerate(results):
                 raw = res.get("text", "").strip()
+                logger.info(f"[whisper] active chunk {idx} raw text: '{raw}'")
 
                 # 3a. Pure-noise / silence hallucination token gate
                 if _is_noise_hallucination(raw):
-                    logger.debug(f"[whisper] noise-hallucination dropped: '{raw}'")
+                    logger.info(f"[whisper] noise-hallucination dropped: '{raw}'")
                     transcriptions_active.append("")
                     continue
 
                 # 3b. Generic repetition deduplication (sliding window n-gram)
                 cleaned = _deduplicate(raw)
+                logger.info(f"[whisper] active chunk {idx} deduplicated text: '{cleaned}'")
 
                 # 3c. Post-dedup orphan word check.
                 # When a large loop is removed (e.g. "is It's a day-to-day × 49")
@@ -301,7 +313,7 @@ class WhisperEngine:
                 # genuine short responses.
                 if (len(cleaned.split()) < MIN_WORDS_AFTER_DEDUP
                         and len(raw.split()) >= MIN_WORDS_AFTER_DEDUP):
-                    logger.debug(
+                    logger.info(
                         f"[whisper] orphan after dedup dropped: '{cleaned}' "
                         f"(original: '{raw[:80]}')"
                     )
@@ -318,12 +330,12 @@ class WhisperEngine:
                 transcriptions.append(next(active_iter) if passed else "")
 
             latency = time.time() - start_time
-            logger.debug(f"[whisper] {len(audio_batch)} item(s) → {latency:.3f}s")
+            logger.info(f"[whisper] transcription complete for {len(audio_batch)} item(s) in {latency:.3f}s. results: {transcriptions}")
             return transcriptions, latency
 
         except Exception as e:
             latency = time.time() - start_time
-            logger.error(f"[whisper] transcription error: {e}")
+            logger.error(f"[whisper] transcription error: {e}", exc_info=True)
             return ["" for _ in audio_batch], latency
 
     def get_model_info(self) -> dict:

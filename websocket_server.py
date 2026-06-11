@@ -200,30 +200,38 @@ class STTServer:
     # ── processing loop ──────────────────────────────────────────────────────
 
     async def processing_loop(self):
-        logger.info("Started background processing loop.")
+        logger.info("[processing_loop] Started background processing loop.")
         while self.is_running:
             try:
+                logger.info("[processing_loop] Waiting for batch from audio_queue...")
                 items = await self.audio_queue.dequeue_batch(
                     max_batch_size=self.config.MAX_BATCH_SIZE,
                     wait_ms=self.config.MAX_BATCH_WAIT_MS,
                 )
                 if not items:
+                    logger.info("[processing_loop] Dequeued empty batch. Continuing...")
                     continue
 
+                logger.info(f"[processing_loop] Dequeued batch of {len(items)} items. Building batch...")
                 batch_items = self.batch_manager.build_batch(items)
                 audio_arrays = [item.audio_data for item in batch_items]
 
+                logger.info(f"[processing_loop] Calling Whisper engine to transcribe batch of {len(audio_arrays)} items...")
                 transcriptions, latency = self.whisper_engine.transcribe_batch(
                     audio_batch=audio_arrays,
                     sample_rate=self.config.SAMPLE_RATE
                 )
+                logger.info(f"[processing_loop] Whisper completed transcription in {latency:.3f}s. Results: {transcriptions}")
 
                 for batch_item, text in zip(batch_items, transcriptions):
                     conn_id  = batch_item.connection_id
                     is_final = getattr(batch_item, 'is_final', False)
                     conn_state = self.registry.get_connection(conn_id)
 
+                    logger.info(f"[processing_loop] Processing result for connection {conn_id} (is_final={is_final}, raw_text='{text}')")
+
                     if not conn_state:
+                        logger.warning(f"[processing_loop] Connection {conn_id} not found in registry. Skipping.")
                         continue
 
                     if text:
@@ -232,11 +240,13 @@ class STTServer:
                             # reset the partial delta baseline for the next turn.
                             send_text = text
                             conn_state.last_partial_text = ""
+                            logger.info(f"[processing_loop] Connection {conn_id} (FINAL): sending full text '{send_text}'")
                         else:
                             # Partial — Whisper re-transcribed the full sliding window,
                             # so strip the prefix that was already sent to avoid the
                             # client seeing the same words repeated on every fire.
                             send_text = _partial_delta(conn_state.last_partial_text, text)
+                            logger.info(f"[processing_loop] Connection {conn_id} (PARTIAL): last='{conn_state.last_partial_text}', new='{text}' -> delta='{send_text}'")
                             if send_text:
                                 # Advance the baseline to include what we're about to send.
                                 conn_state.last_partial_text = (
@@ -244,6 +254,7 @@ class STTServer:
                                 )
                             else:
                                 # No new words — skip this partial entirely.
+                                logger.info(f"[processing_loop] Connection {conn_id} (PARTIAL): No new words. Skipping.")
                                 continue
 
                         response = {
@@ -253,6 +264,7 @@ class STTServer:
                             "latency_seconds": latency
                         }
                         try:
+                            logger.info(f"[processing_loop] Sending JSON response to connection {conn_id}: {response}")
                             await conn_state.websocket.send_json(response)
                             conn_state.transcripts_sent += 1
                             conn_state.update_latency(latency)
@@ -262,32 +274,44 @@ class STTServer:
                             )
                             logger.info(f"Transcribe Hit #{self.total_transcripts} | Conn: {conn_id} | Latency: {latency:.3f}s | Final: {is_final} | Text Length: {len(send_text)}")
                         except Exception as e:
-                            logger.error(f"Failed to send transcript to {conn_id}: {e}")
+                            logger.error(f"[processing_loop] Failed to send transcript to {conn_id}: {e}", exc_info=True)
                             await self.registry.unregister(conn_id)
                             continue
+                    else:
+                        logger.info(f"[processing_loop] Connection {conn_id}: text is empty. Skipping send.")
 
                     # ── LLM only fires on the FINAL utterance ────────────────
                     if is_final and text:
+                        logger.info(f"[processing_loop] Connection {conn_id} is FINAL with text. Triggering LLM pipeline...")
                         await self.run_llm_pipeline(conn_state, text)
+                    elif is_final and not text:
+                        logger.warning(f"[processing_loop] Connection {conn_id} is FINAL but text is empty. LLM pipeline NOT triggered.")
 
             except asyncio.CancelledError:
+                logger.info("[processing_loop] Background processing loop cancelled.")
                 break
             except Exception as e:
-                logger.error(f"Error in processing loop: {e}", exc_info=True)
+                logger.error(f"[processing_loop] Error in processing loop: {e}", exc_info=True)
                 await asyncio.sleep(0.1)
 
     # ── LLM pipeline ─────────────────────────────────────────────────────────
 
     async def run_llm_pipeline(self, conn_state, text: str):
         """Kick off LLM → TTS for the finalised user utterance."""
+        conn_id = conn_state.connection_id
+        logger.info(f"[run_llm_pipeline] [{conn_id}] Initializing LLM pipeline for input text: '{text}'")
+        
         # Cancel any leftover work from the previous turn.
+        logger.info(f"[run_llm_pipeline] [{conn_id}] Aborting any active LLM/TTS engine generations...")
         conn_state.llm_engine.abort()
         conn_state.tts_engine.abort()
 
         if conn_state.llm_task and not conn_state.llm_task.done():
+            logger.info(f"[run_llm_pipeline] [{conn_id}] Cancelling active LLM task...")
             conn_state.llm_task.cancel()
             try:
                 await conn_state.llm_task
+                logger.info(f"[run_llm_pipeline] [{conn_id}] Active LLM task successfully cancelled.")
             except asyncio.CancelledError:
                 pass
 
@@ -300,27 +324,42 @@ class STTServer:
                 tts_task = None
                 
                 async def token_stream():
+                    logger.info(f"[run_llm_pipeline] [{conn_id}] token_stream reader started")
                     while True:
                         token = await token_queue.get()
                         if token is None:
+                            logger.info(f"[run_llm_pipeline] [{conn_id}] token_stream reader received None (EOF)")
                             break
                         yield token
 
                 async def _tts_worker():
                     try:
+                        logger.info(f"[run_llm_pipeline] [{conn_id}] TTS worker task started. Waiting for tokens...")
+                        chunk_count = 0
                         async for audio_chunk in conn_state.tts_engine.generate_audio(token_stream()):
+                            chunk_count += 1
+                            logger.info(f"[run_llm_pipeline] [{conn_id}] TTS worker generated chunk #{chunk_count} ({len(audio_chunk)} bytes). Sending bytes to client...")
                             await conn_state.websocket.send_bytes(audio_chunk)
+                        logger.info(f"[run_llm_pipeline] [{conn_id}] TTS worker finished generating all audio chunks.")
                     except asyncio.CancelledError:
-                        pass
+                        logger.info(f"[run_llm_pipeline] [{conn_id}] TTS worker task cancelled.")
                     except Exception as e:
-                        logger.error(f"TTS Error: {e}")
+                        logger.error(f"[run_llm_pipeline] [{conn_id}] TTS Error: {e}", exc_info=True)
                         
                 tts_task = asyncio.create_task(_tts_worker())
                 conn_state.llm_is_active = True
                 
                 full_text = ""
+                first_token = True
+                logger.info(f"[run_llm_pipeline] [{conn_id}] Requesting response from LLM engine...")
                 async for token in conn_state.llm_engine.generate_response(text):
+                    if first_token:
+                        ttft = time.time() - llm_start_time
+                        logger.info(f"[run_llm_pipeline] [{conn_id}] First LLM token received in {ttft:.3f}s: '{token}'")
+                        first_token = False
+                        
                     full_text += token
+                    logger.info(f"[run_llm_pipeline] [{conn_id}] LLM generated token: '{token}'")
                     
                     try:
                         await conn_state.websocket.send_json({
@@ -328,29 +367,36 @@ class STTServer:
                             "text": token
                         })
                     except Exception as e:
-                        logger.error(f"Error sending LLM token: {e}")
+                        logger.error(f"[run_llm_pipeline] [{conn_id}] Error sending LLM token to client: {e}", exc_info=True)
                         
                     await token_queue.put(token)
                     
                 await token_queue.put(None)
+                logger.info(f"[run_llm_pipeline] [{conn_id}] LLM finished response generation. Waiting for TTS worker...")
                 if tts_task:
                     await tts_task
                 
                 reply_latency = time.time() - llm_start_time
-                logger.info(f"LLM Reply completed | Final output length: {len(full_text)} chars | Reply Latency: {reply_latency:.3f}s")
+                logger.info(f"[run_llm_pipeline] [{conn_id}] LLM Reply completed | Final output length: {len(full_text)} chars | Reply Latency: {reply_latency:.3f}s")
                 
                 await conn_state.websocket.send_json({
                     "status": "llm_final",
                     "text": full_text
                 })
             except asyncio.CancelledError:
+                logger.info(f"[run_llm_pipeline] [{conn_id}] LLM job task cancelled.")
                 # Cancel TTS too so it doesn't keep sending stale audio
                 if tts_task and not tts_task.done():
+                    logger.info(f"[run_llm_pipeline] [{conn_id}] Cancelling TTS worker task...")
                     tts_task.cancel()
             except Exception as e:
-                logger.error(f"LLM Error: {e}")
+                logger.error(f"[run_llm_pipeline] [{conn_id}] LLM Error in _llm_job: {e}", exc_info=True)
             finally:
                 conn_state.llm_is_active = False
+                logger.info(f"[run_llm_pipeline] [{conn_id}] LLM pipeline completed and marked inactive.")
+
+        conn_state.llm_task = asyncio.create_task(_llm_job())
+        logger.info(f"[run_llm_pipeline] [{conn_id}] LLM job task created and running in background.")
 
         conn_state.llm_task = asyncio.create_task(_llm_job())
 
@@ -381,11 +427,23 @@ class STTServer:
 
         try:
             while True:
-                raw = await websocket.receive_bytes()
+                message = await websocket.receive()
+                if message.get("type") == "websocket.disconnect":
+                    raise WebSocketDisconnect(message.get("code", 1000))
+                
+                if "bytes" not in message:
+                    if "text" in message:
+                        logger.warning(f"[{conn_id}] Received text message instead of bytes: {message['text'][:500]}")
+                    else:
+                        logger.warning(f"[{conn_id}] Received unknown message structure: {message}")
+                    continue
+                
+                raw = message["bytes"]
                 conn_state.update_seen()
 
                 # ── Parse 32-byte binary header ───────────────────────────────
                 session_id, seq_num, client_ts_ms, audio_bytes = _parse_header(raw)
+                logger.info(f"[{conn_id}] Recv raw={len(raw)} bytes, parsed audio_bytes={len(audio_bytes)}, seq={seq_num}, client_ts={client_ts_ms}")
 
                 # Store session ID on first packet
                 if session_id and not conn_state.client_session_id:
@@ -397,10 +455,10 @@ class STTServer:
                 if seq_num != 0 and conn_state.last_seq_num >= 0:
                     gap = (seq_num - conn_state.last_seq_num) & 0xFFFFFFFF
                     if gap == 0:
-                        logger.debug(f"Duplicate packet seq={seq_num} dropped")
+                        logger.info(f"[{conn_id}] Duplicate packet seq={seq_num} dropped")
                         continue
                     if gap > 0x7FFFFFFF:  # wrapped backwards = out of order
-                        logger.warning(f"Out-of-order packet seq={seq_num} (last={conn_state.last_seq_num}) dropped")
+                        logger.warning(f"[{conn_id}] Out-of-order packet seq={seq_num} (last={conn_state.last_seq_num}) dropped")
                         continue
                 conn_state.last_seq_num = seq_num
 
@@ -410,16 +468,18 @@ class STTServer:
                 audio_int16 = _float32_to_int16(audio_bytes)
 
                 if len(audio_int16) == 0:
+                    logger.info(f"[{conn_id}] Converted int16 audio array is empty. Skipping.")
                     continue
 
                 # Measure end-to-end latency from client capture to server receipt
                 if client_ts_ms > 0:
                     e2e_ms = (time.time() * 1000) - client_ts_ms
-                    logger.debug(f"E2E recv latency: {e2e_ms:.1f} ms (seq={seq_num})")
+                    logger.info(f"[{conn_id}] E2E recv latency: {e2e_ms:.1f} ms (seq={seq_num})")
 
                 # ── VAD ───────────────────────────────────────────────────────
                 speech_int16, _ = self.vad_engine.detect_speech(audio_int16)
                 has_speech = len(speech_int16) > 0
+                logger.info(f"[{conn_id}] VAD check: has_speech={has_speech} (speech_samples={len(speech_int16)}/{len(audio_int16)})")
 
                 if has_speech:
                     silence_samples = 0
@@ -442,38 +502,48 @@ class STTServer:
 
                     # ── Hard cap: keep buffer within Whisper's context ────────
                     total_samples = sum(len(c) for c in speech_chunks)
+                    logger.info(f"[{conn_id}] Speech buffer size: {total_samples} samples ({total_samples/sample_rate:.2f}s)")
                     if total_samples > MAX_UTTERANCE_SAMPLES:
+                        logger.info(f"[{conn_id}] Speech buffer exceeds hard cap ({MAX_UTTERANCE_SAMPLES}). Truncating oldest chunks...")
                         while speech_chunks and sum(len(c) for c in speech_chunks) > PARTIAL_WINDOW_SAMPLES:
                             speech_chunks.pop(0)
 
                     # ── Sliding-window partial STT ────────────────────────────
                     total_samples = sum(len(c) for c in speech_chunks)
+                    logger.info(f"[{conn_id}] Partial trigger check: samples_since_partial={samples_since_partial}/{PARTIAL_SEND_EVERY}, total_samples={total_samples}/{MIN_SPEECH_SAMPLES}")
                     if (
                         samples_since_partial >= PARTIAL_SEND_EVERY
                         and total_samples     >= MIN_SPEECH_SAMPLES
                         and not self.audio_queue.is_full()
                     ):
                         window = np.concatenate(speech_chunks)[-PARTIAL_WINDOW_SAMPLES:]
+                        logger.info(f"[{conn_id}] Triggering PARTIAL STT. Enqueuing {len(window)} samples ({len(window)/sample_rate:.2f}s)")
                         await self.audio_queue.enqueue(
                             conn_id,
                             window.tobytes(),
                             is_final=False
                         )
                         samples_since_partial = 0
+                    elif self.audio_queue.is_full():
+                        logger.warning(f"[{conn_id}] Cannot enqueue PARTIAL STT: Audio queue is FULL!")
 
                 else:
                     # ── Silence ───────────────────────────────────────────────
                     if is_speaking:
                         silence_samples += len(audio_int16)
+                        logger.info(f"[{conn_id}] Silence check: accumulated silence_samples={silence_samples}/{SILENCE_END_SAMPLES}")
 
                         if silence_samples >= SILENCE_END_SAMPLES:
                             is_speaking = False
                             total_speech = sum(len(c) for c in speech_chunks)
+                            logger.info(f"[{conn_id}] Speech ended. Total speaking time: {total_speech/sample_rate:.2f}s ({total_speech} samples)")
 
                             if total_speech >= MIN_SPEECH_SAMPLES and not self.audio_queue.is_full():
                                 full_audio = np.concatenate(speech_chunks)
                                 if len(full_audio) > MAX_UTTERANCE_SAMPLES:
+                                    logger.info(f"[{conn_id}] Utterance exceeds MAX_UTTERANCE_SAMPLES ({MAX_UTTERANCE_SAMPLES}). Truncating...")
                                     full_audio = full_audio[-MAX_UTTERANCE_SAMPLES:]
+                                logger.info(f"[{conn_id}] Triggering FINAL STT. Enqueuing {len(full_audio)} samples ({len(full_audio)/sample_rate:.2f}s)")
                                 await self.audio_queue.enqueue(
                                     conn_id,
                                     full_audio.tobytes(),
@@ -483,9 +553,11 @@ class STTServer:
                                     f"Utterance finalised {total_speech/sample_rate:.2f}s → {conn_id}"
                                 )
                             elif total_speech < MIN_SPEECH_SAMPLES:
-                                logger.debug(
-                                    f"Short fragment {total_speech/sample_rate:.2f}s dropped"
+                                logger.info(
+                                    f"[{conn_id}] Short fragment {total_speech/sample_rate:.2f}s dropped"
                                 )
+                            elif self.audio_queue.is_full():
+                                logger.error(f"[{conn_id}] Cannot enqueue FINAL STT: Audio queue is FULL!")
 
                             speech_chunks = []
                             silence_samples = 0
@@ -502,6 +574,7 @@ class STTServer:
         except Exception as e:
             logger.error(f"WebSocket error for {conn_id}: {e}", exc_info=True)
         finally:
+            logger.info(f"[{conn_id}] Closing websocket. Cleaning up active tasks...")
             conn_state.llm_engine.abort()
             conn_state.tts_engine.abort()
             await self.registry.unregister(conn_id)

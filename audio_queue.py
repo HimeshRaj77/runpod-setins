@@ -59,18 +59,20 @@ class AudioQueue:
 
             try:
                 # Non-blocking put with timeout
+                logger.info(f"[AudioQueue] Attempting to enqueue audio for {connection_id} (is_final={is_final}, size={len(audio_data)} bytes)")
                 await asyncio.wait_for(self.queue.put(item), timeout=1.0)
                 self.total_items += 1
+                logger.info(f"[AudioQueue] Enqueued successfully. Queue depth: {self.queue.qsize()}/{self.max_depth}")
                 return True
             except asyncio.TimeoutError:
                 self.dropped_items += 1
                 logger.warning(
-                    f"Failed to enqueue audio from {connection_id}, dropped {self.dropped_items} items"
+                    f"[AudioQueue] Failed to enqueue audio from {connection_id} (timeout), dropped {self.dropped_items} items. Depth: {self.queue.qsize()}"
                 )
                 return False
 
         except Exception as e:
-            logger.error(f"Error enqueuing audio: {e}")
+            logger.error(f"[AudioQueue] Error enqueuing audio: {e}", exc_info=True)
             return False
 
     async def dequeue_batch(
@@ -91,36 +93,46 @@ class AudioQueue:
 
         try:
             # Get first item (blocking)
+            logger.info(f"[AudioQueue] Dequeue waiting for first item (timeout={timeout}s)...")
             first_item = await asyncio.wait_for(self.queue.get(), timeout=timeout)
             batch.append(first_item)
+            logger.info(f"[AudioQueue] Dequeued first item from {first_item.connection_id} (is_final={first_item.is_final}). Current depth: {self.queue.qsize()}")
 
             # ── Express lane for finals ───────────────────────────────────────
             # A final item means the user just finished speaking. Process it
             # immediately — do NOT wait for more items to fill a batch.
             if first_item.is_final:
+                logger.info(f"[AudioQueue] Item is FINAL. Express lane bypass batch waiting.")
                 return batch
 
             # ── Partial items: collect a batch to amortise GPU overhead ───────
             start = time.time()
+            logger.info(f"[AudioQueue] Collecting batch (max={max_batch_size}, wait={wait_ms}ms)...")
             while len(batch) < max_batch_size and (time.time() - start) < wait_seconds:
                 try:
+                    remaining_time = wait_seconds - (time.time() - start)
+                    if remaining_time <= 0:
+                        break
                     item = await asyncio.wait_for(
-                        self.queue.get(), timeout=(wait_seconds - (time.time() - start))
+                        self.queue.get(), timeout=remaining_time
                     )
                     batch.append(item)
+                    logger.info(f"[AudioQueue] Collected additional item from {item.connection_id} (is_final={item.is_final})")
                     # If we hit a final mid-batch, stop collecting and return now.
                     if item.is_final:
+                        logger.info(f"[AudioQueue] Hit final item in batch collection. Returning batch of {len(batch)}")
                         break
                 except asyncio.TimeoutError:
                     break
 
+            logger.info(f"[AudioQueue] Returning batch of {len(batch)} items. Remaining depth: {self.queue.qsize()}")
             return batch
 
         except asyncio.TimeoutError:
-            logger.debug(f"Queue timeout, returning batch of {len(batch)} items")
+            logger.info(f"[AudioQueue] Dequeue timeout (no items). Returning empty batch.")
             return batch
         except Exception as e:
-            logger.error(f"Error dequeuing batch: {e}")
+            logger.error(f"[AudioQueue] Error dequeuing batch: {e}", exc_info=True)
             return batch
 
     def get_depth(self) -> int:
