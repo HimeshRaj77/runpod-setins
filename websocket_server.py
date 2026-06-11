@@ -468,7 +468,7 @@ class STTServer:
 
                 # ── Parse 32-byte binary header ───────────────────────────────
                 session_id, seq_num, client_ts_ms, audio_bytes = _parse_header(raw)
-                logger.info(f"[{conn_id}] Recv raw={len(raw)} bytes, parsed audio_bytes={len(audio_bytes)}, seq={seq_num}, client_ts={client_ts_ms}")
+                logger.info(f"[{conn_id}] Recv raw={len(raw)} bytes, header_hex={raw[:32].hex()}, seq={seq_num}, client_ts={client_ts_ms}")
 
                 # Store session ID on first packet
                 if session_id and not conn_state.client_session_id:

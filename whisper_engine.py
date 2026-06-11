@@ -262,18 +262,16 @@ class WhisperEngine:
                 return ["" for _ in audio_batch], latency
 
             # ── Layer 2: Inference-time anti-hallucination ────────────────────
-            # no_speech_threshold and compression_ratio_threshold are pipeline-level
-            # arguments in HuggingFace — they MUST be passed to self.pipe() directly,
-            # not inside generate_kwargs. Passing them in generate_kwargs causes the
-            # "unused model_kwargs" error and they have zero effect.
+            # Note: We do NOT pass no_speech_threshold and compression_ratio_threshold
+            # here because they cause a known bug in certain transformers versions
+            # (UnboundLocalError: cannot access local variable 'logprobs').
+            # Instead, we rely on our multi-layer pre-and-post-filtering.
             logger.info(f"[whisper] Running pipeline inference on {len(audio_floats)} active chunks...")
             infer_start = time.time()
             with torch.no_grad():
                 results = self.pipe(
                     audio_floats,
                     batch_size=len(audio_floats),
-                    no_speech_threshold=self.no_speech_threshold,
-                    compression_ratio_threshold=self.compression_ratio_threshold,
                     generate_kwargs={
                         "language": self.language if self.language != "auto" else None,
                         "task": self.task,
