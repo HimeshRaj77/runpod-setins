@@ -28,18 +28,12 @@ class VadEngine:
         assert sample_rate == 16000, "Silero VAD requires 16kHz sample rate"
 
         try:
-            # Load Silero VAD model.
-            # trust_repo=True skips the GitHub fork-validation API call that can
-            # hit a 403 rate-limit on shared-IP environments such as RunPod.
-            self.model, utils = torch.hub.load(
-                repo_or_dir="snakers4/silero-vad",
-                model="silero_vad",
-                force_reload=False,
-                onnx=False,  # Disable ONNX to get native PyTorch module
-                verbose=False,
-                trust_repo=True,
-            )
-            self.get_speech_timestamps = utils[0]
+            # Load Silero VAD model via the official pip package.
+            # This completely bypasses torch.hub and the GitHub API, 
+            # avoiding any rate limit issues (403).
+            from silero_vad import load_silero_vad, get_speech_timestamps
+            self.model = load_silero_vad(onnx=False)
+            self.get_speech_timestamps = get_speech_timestamps
 
             self.model.eval()
 
