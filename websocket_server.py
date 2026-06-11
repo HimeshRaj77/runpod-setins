@@ -161,10 +161,16 @@ class STTServer:
             max_batch_wait_ms=config.MAX_BATCH_WAIT_MS,
             min_batch_wait_ms=config.MIN_BATCH_WAIT_MS
         )
-        self.vad_engine = VadEngine(
-            threshold=config.VAD_THRESHOLD,
-            sample_rate=config.SAMPLE_RATE
-        )
+        self.vad_engine = None
+        if config.VAD_ENABLED:
+            logger.info("VAD is enabled. Initializing Silero VadEngine...")
+            self.vad_engine = VadEngine(
+                threshold=config.VAD_THRESHOLD,
+                sample_rate=config.SAMPLE_RATE
+            )
+        else:
+            logger.info("VAD is disabled. Skipping VadEngine initialization.")
+            
         self.whisper_engine = WhisperEngine(
             model_id=config.WHISPER_MODEL,
             device=config.DEVICE,
@@ -477,9 +483,18 @@ class STTServer:
                     logger.info(f"[{conn_id}] E2E recv latency: {e2e_ms:.1f} ms (seq={seq_num})")
 
                 # ── VAD ───────────────────────────────────────────────────────
-                speech_int16, _ = self.vad_engine.detect_speech(audio_int16)
-                has_speech = len(speech_int16) > 0
-                logger.info(f"[{conn_id}] VAD check: has_speech={has_speech} (speech_samples={len(speech_int16)}/{len(audio_int16)})")
+                if self.config.VAD_ENABLED:
+                    speech_int16, _ = self.vad_engine.detect_speech(audio_int16)
+                    has_speech = len(speech_int16) > 0
+                    logger.info(f"[{conn_id}] VAD check: has_speech={has_speech} (speech_samples={len(speech_int16)}/{len(audio_int16)})")
+                else:
+                    # If VAD is disabled, we use a simple energy-based threshold gate.
+                    # This completely bypasses the deep learning VAD model to save CPU/GPU.
+                    f = audio_int16.astype(np.float32) / 32768.0
+                    energy = _audio_energy(f)
+                    has_speech = energy >= MIN_AUDIO_ENERGY
+                    speech_int16 = audio_int16 if has_speech else np.array([], dtype=np.int16)
+                    logger.info(f"[{conn_id}] VAD (Energy-based fallback, Silero disabled) check: has_speech={has_speech} (energy={energy:.6f}, threshold={MIN_AUDIO_ENERGY})")
 
                 if has_speech:
                     silence_samples = 0

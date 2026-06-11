@@ -11,6 +11,16 @@ if [[ "$USE_M4_SETTINGS" =~ ^[Yy]$ ]]; then
     export DTYPE="float16"
 fi
 
+# Ask for VAD
+read -p "Do you want to enable Voice Activity Detection (VAD)? (Y/n): " ENABLE_VAD
+if [[ "$ENABLE_VAD" =~ ^[Nn]$ ]]; then
+    echo "Disabling VAD..."
+    export VAD_ENABLED="false"
+else
+    echo "Enabling VAD..."
+    export VAD_ENABLED="true"
+fi
+
 # Ask for port
 read -p "Enter the port to run the server on [8000]: " INPUT_PORT
 PORT=${INPUT_PORT:-8000}
