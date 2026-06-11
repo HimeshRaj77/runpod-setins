@@ -42,6 +42,4 @@ WORKERS=${WORKERS:-1}
 exec uvicorn server:app \
     --host 0.0.0.0 \
     --port $PORT \
-    --workers $WORKERS \
-    --ws-ping-interval 20 \
-    --ws-ping-timeout 30
+    --workers $WORKERS
