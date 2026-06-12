@@ -21,20 +21,21 @@ class LLMEngine:
         self._current_task: Optional[asyncio.Task] = None
         self._abort_event = asyncio.Event()
 
-    async def generate_response(self, prompt: str) -> AsyncGenerator[str, None]:
+    async def generate_response(self, prompt: str, system_prompt: Optional[str] = None) -> AsyncGenerator[str, None]:
         """
         Generate response from Ollama or Groq, streaming tokens continuously.
         """
         self._abort_event.clear()
         if self.provider == "groq":
-            async for token in self._generate_groq(prompt):
+            async for token in self._generate_groq(prompt, system_prompt):
                 yield token
             return
         url = f"{self.host}/api/generate"
+        system = system_prompt or "You are a helpful, conversational AI voice assistant. Please provide concise, natural-sounding spoken responses. Do not use markdown, emojis, or lists. Do not repeat yourself."
         payload = {
             "model": self.model,
             "prompt": prompt,
-            "system": "You are a helpful, conversational AI voice assistant. Please provide concise, natural-sounding spoken responses. Do not use markdown, emojis, or lists. Do not repeat yourself.",
+            "system": system,
             "stream": True,
             "options": {
                 "temperature": 0.6,
@@ -89,17 +90,17 @@ class LLMEngine:
         if self._current_task and not self._current_task.done():
             self._current_task.cancel()
 
-    async def _generate_groq(self, prompt: str) -> AsyncGenerator[str, None]:
+    async def _generate_groq(self, prompt: str, system_prompt: Optional[str] = None) -> AsyncGenerator[str, None]:
         url = "https://api.groq.com/openai/v1/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.groq_api_key}",
             "Content-Type": "application/json"
         }
-        system_prompt = "You are a helpful, conversational AI voice assistant. Please provide concise, natural-sounding spoken responses. Do not use markdown, emojis, or lists. Do not repeat yourself."
+        system = system_prompt or "You are a helpful, conversational AI voice assistant. Please provide concise, natural-sounding spoken responses. Do not use markdown, emojis, or lists. Do not repeat yourself."
         payload = {
             "model": self.groq_model,
             "messages": [
-                {"role": "system", "content": system_prompt},
+                {"role": "system", "content": system},
                 {"role": "user", "content": prompt}
             ],
             "stream": True,

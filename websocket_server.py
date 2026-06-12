@@ -376,38 +376,61 @@ class STTServer:
                 
                 full_text = ""
                 first_token = True
-                logger.info(f"[run_llm_pipeline] [{conn_id}] Requesting response from LLM engine...")
-                async for token in conn_state.llm_engine.generate_response(text):
-                    if first_token:
-                        ttft = time.time() - llm_start_time
-                        logger.info(f"[run_llm_pipeline] [{conn_id}] First LLM token received in {ttft:.3f}s: '{token}'")
-                        first_token = False
-                        
-                    full_text += token
-                    logger.info(f"[run_llm_pipeline] [{conn_id}] LLM generated token: '{token}'")
-                    
-                    try:
-                        await conn_state.websocket.send_json({
-                            "status": "llm_token",
-                            "text": token
-                        })
-                    except Exception as e:
-                        logger.error(f"[run_llm_pipeline] [{conn_id}] Error sending LLM token to client: {e}", exc_info=True)
-                        
-                    await token_queue.put(token)
-                    
-                await token_queue.put(None)
-                logger.info(f"[run_llm_pipeline] [{conn_id}] LLM finished response generation. Waiting for TTS worker...")
-                if tts_task:
-                    await tts_task
                 
-                reply_latency = time.time() - llm_start_time
-                logger.info(f"[run_llm_pipeline] [{conn_id}] LLM Reply completed | Final output length: {len(full_text)} chars | Reply Latency: {reply_latency:.3f}s")
-                
-                await conn_state.websocket.send_json({
-                    "status": "llm_final",
-                    "text": full_text
-                })
+                if not conn_state.llm_enabled:
+                    logger.info(f"[run_llm_pipeline] [{conn_id}] LLM is disabled. Forwarding text directly.")
+                    full_text = text
+                    await conn_state.websocket.send_json({
+                        "status": "llm_final",
+                        "text": full_text
+                    })
+                    await token_queue.put(full_text)
+                    await token_queue.put(None)
+                    if tts_task:
+                        await tts_task
+                else:
+                    system_prompts = {
+                        "punctuation": "You are a text formatter. Fix punctuation and restore capitalization of the following text. Do not add conversational filler. Output only the formatted text.",
+                        "identify_speakers": "You are an assistant. Identify the speakers and their dialogues from the following text. Format clearly.",
+                        "summarize": "You are an assistant. Summarize the following meeting transcript. Output only the summary.",
+                        "action_items": "You are an assistant. Extract action items from the following text. Output only the action items.",
+                        "json": "You are an assistant. Convert the following spoken commands into structured JSON. Output only the JSON.",
+                        "conversational": "You are a helpful, conversational AI voice assistant. Please provide concise, natural-sounding spoken responses. Do not use markdown, emojis, or lists. Do not repeat yourself."
+                    }
+                    system_prompt = system_prompts.get(conn_state.llm_mode, system_prompts["conversational"])
+
+                    logger.info(f"[run_llm_pipeline] [{conn_id}] Requesting response from LLM engine (mode: {conn_state.llm_mode})...")
+                    async for token in conn_state.llm_engine.generate_response(text, system_prompt):
+                        if first_token:
+                            ttft = time.time() - llm_start_time
+                            logger.info(f"[run_llm_pipeline] [{conn_id}] First LLM token received in {ttft:.3f}s: '{token}'")
+                            first_token = False
+                            
+                        full_text += token
+                        logger.info(f"[run_llm_pipeline] [{conn_id}] LLM generated token: '{token}'")
+                        
+                        try:
+                            await conn_state.websocket.send_json({
+                                "status": "llm_token",
+                                "text": token
+                            })
+                        except Exception as e:
+                            logger.error(f"[run_llm_pipeline] [{conn_id}] Error sending LLM token to client: {e}", exc_info=True)
+                            
+                        await token_queue.put(token)
+                        
+                    await token_queue.put(None)
+                    logger.info(f"[run_llm_pipeline] [{conn_id}] LLM finished response generation. Waiting for TTS worker...")
+                    if tts_task:
+                        await tts_task
+                    
+                    reply_latency = time.time() - llm_start_time
+                    logger.info(f"[run_llm_pipeline] [{conn_id}] LLM Reply completed | Final output length: {len(full_text)} chars | Reply Latency: {reply_latency:.3f}s")
+                    
+                    await conn_state.websocket.send_json({
+                        "status": "llm_final",
+                        "text": full_text
+                    })
             except asyncio.CancelledError:
                 logger.info(f"[run_llm_pipeline] [{conn_id}] LLM job task cancelled.")
                 # Cancel TTS too so it doesn't keep sending stale audio
@@ -456,6 +479,17 @@ class STTServer:
                 
                 if "bytes" not in message:
                     if "text" in message:
+                        try:
+                            msg_data = json.loads(message["text"])
+                            if msg_data.get("type") == "config":
+                                if "llm_enabled" in msg_data:
+                                    conn_state.llm_enabled = bool(msg_data["llm_enabled"])
+                                if "llm_mode" in msg_data:
+                                    conn_state.llm_mode = str(msg_data["llm_mode"])
+                                logger.info(f"[{conn_id}] Updated config: llm_enabled={conn_state.llm_enabled}, llm_mode={conn_state.llm_mode}")
+                                continue
+                        except Exception:
+                            pass
                         logger.warning(f"[{conn_id}] Received text message instead of bytes: {message['text'][:500]}")
                     else:
                         logger.warning(f"[{conn_id}] Received unknown message structure: {message}")

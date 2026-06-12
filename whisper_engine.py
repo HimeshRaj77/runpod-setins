@@ -196,9 +196,13 @@ class WhisperEngine:
                 self.model = self.model.to(device)
             self.model.eval()
 
-            self.processor = AutoProcessor.from_pretrained(
-                model_id, cache_dir=cache_dir
-            )
+            try:
+                self.processor = AutoProcessor.from_pretrained(
+                    model_id, cache_dir=cache_dir
+                )
+            except OSError as e:
+                logger.error(f"Failed to load processor for {model_id}. Error: {e}")
+                raise e
 
             # ── Pipeline ─────────────────────────────────────────────────────
             # We manage chunking ourselves; do NOT set chunk_length_s here.

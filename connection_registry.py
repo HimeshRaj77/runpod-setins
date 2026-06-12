@@ -60,6 +60,8 @@ class ConnectionState:
     tts_engine: TTSEngine = field(default_factory=TTSEngine)
     llm_task: Optional[asyncio.Task] = None
     llm_is_active: bool = False   # True while LLM+TTS are generating a response
+    llm_enabled: bool = True      # Whether LLM processing is enabled
+    llm_mode: str = "conversational" # Mode for LLM processing
 
     # Packet ordering / deduplication (driven by the 32-byte header seq_num)
     last_seq_num: int = -1          # last successfully processed sequence number
