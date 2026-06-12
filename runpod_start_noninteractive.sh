@@ -20,6 +20,8 @@ export DTYPE="${DTYPE:-float16}"
 export VAD_ENABLED="${VAD_ENABLED:-true}"
 export PORT="${PORT:-8000}"
 export LLM_PROVIDER="${LLM_PROVIDER:-groq}"
+export LLM_ENABLED="${LLM_ENABLED:-true}"
+export LLM_MODE="${LLM_MODE:-conversational}"
 export WORKERS="${WORKERS:-1}"
 export LOG_LEVEL="${LOG_LEVEL:-INFO}"
 export MIN_AUDIO_ENERGY="${MIN_AUDIO_ENERGY:-0.001}"
@@ -30,7 +32,7 @@ if [ -z "$GROQ_API_KEY" ] && [ "$LLM_PROVIDER" = "groq" ]; then
     exit 1
 fi
 
-echo "Config: DEVICE=$DEVICE | VAD=$VAD_ENABLED | PORT=$PORT | LLM=$LLM_PROVIDER | WORKERS=$WORKERS"
+echo "Config: DEVICE=$DEVICE | VAD=$VAD_ENABLED | PORT=$PORT | LLM=$LLM_PROVIDER | LLM_ENABLED=$LLM_ENABLED | LLM_MODE=$LLM_MODE | WORKERS=$WORKERS"
 
 # ============================================================================
 # Launch uvicorn with WebSocket keep-alive pings

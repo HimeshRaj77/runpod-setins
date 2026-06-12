@@ -35,6 +35,12 @@ echo "[runpod_start_auto] Port: $PORT"
 export LLM_PROVIDER="${LLM_PROVIDER:-ollama}"
 echo "[runpod_start_auto] LLM_PROVIDER: $LLM_PROVIDER"
 
+export LLM_ENABLED="${LLM_ENABLED:-true}"
+echo "[runpod_start_auto] LLM_ENABLED: $LLM_ENABLED"
+
+export LLM_MODE="${LLM_MODE:-conversational}"
+echo "[runpod_start_auto] LLM_MODE: $LLM_MODE"
+
 # ── Workers: single worker on GPU pod (multi-worker breaks GPU sharing) ───────
 WORKERS="${WORKERS:-1}"
 echo "[runpod_start_auto] Workers: $WORKERS"

@@ -459,7 +459,9 @@ class STTServer:
         # a valid header (which gives us the real client session UUID).
         conn_id = str(id(websocket))
         conn_state = await self.registry.register(conn_id, websocket)
-        logger.info(f"Worker connected: {conn_id}")
+        conn_state.llm_enabled = self.config.LLM_ENABLED
+        conn_state.llm_mode = self.config.LLM_MODE
+        logger.info(f"Worker connected: {conn_id} | Initial LLM config: enabled={conn_state.llm_enabled}, mode={conn_state.llm_mode}")
 
         sample_rate = self.config.SAMPLE_RATE
 

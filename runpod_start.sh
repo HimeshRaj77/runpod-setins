@@ -26,6 +26,18 @@ read -p "Enter the port to run the server on [8000]: " INPUT_PORT
 PORT=${INPUT_PORT:-8000}
 export PORT=$PORT
 
+# Ask for LLM Toggle
+read -p "Do you want to enable the LLM step? (Y/n): " INPUT_LLM_ENABLED
+if [[ "$INPUT_LLM_ENABLED" =~ ^[Nn]$ ]]; then
+    echo "Disabling LLM step..."
+    export LLM_ENABLED="false"
+else
+    echo "Enabling LLM step..."
+    export LLM_ENABLED="true"
+    read -p "Which LLM Mode do you want to use? (conversational/punctuation/summarize/action_items/json/identify_speakers) [conversational]: " INPUT_LLM_MODE
+    export LLM_MODE=${INPUT_LLM_MODE:-conversational}
+fi
+
 # Ask for LLM Provider
 read -p "Which LLM Provider do you want to use? (ollama/groq) [ollama]: " INPUT_PROVIDER
 PROVIDER=${INPUT_PROVIDER:-ollama}

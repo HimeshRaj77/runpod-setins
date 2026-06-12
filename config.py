@@ -64,6 +64,8 @@ class Config:
     LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "ollama")
     GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
     GROQ_MODEL: str = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
+    LLM_ENABLED: bool = os.getenv("LLM_ENABLED", "true").lower() == "true"
+    LLM_MODE: str = os.getenv("LLM_MODE", "conversational")
 
     # Logging
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
