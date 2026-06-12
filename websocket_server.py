@@ -265,47 +265,35 @@ class STTServer:
 
                     if text:
                         if is_final:
-                            # Final utterance — send the complete clean text and
-                            # reset the partial delta baseline for the next turn.
+                            # Final utterance — send the complete clean text
                             send_text = text
                             conn_state.last_partial_text = ""
                             logger.info(f"[processing_loop] Connection {conn_id} (FINAL): sending full text '{send_text}'")
-                        else:
-                            # Partial — Whisper re-transcribed the full sliding window,
-                            # so strip the prefix that was already sent to avoid the
-                            # client seeing the same words repeated on every fire.
-                            send_text = _partial_delta(conn_state.last_partial_text, text)
-                            logger.info(f"[processing_loop] Connection {conn_id} (PARTIAL): last='{conn_state.last_partial_text}', new='{text}' -> delta='{send_text}'")
-                            if send_text:
-                                # Advance the baseline to include what we're about to send.
-                                conn_state.last_partial_text = (
-                                    (conn_state.last_partial_text + " " + send_text).strip()
+                            
+                            response = {
+                                "status": "transcribed",
+                                "text": send_text,
+                                "is_final": is_final,
+                                "latency_seconds": latency
+                            }
+                            try:
+                                logger.info(f"[processing_loop] Sending JSON response to connection {conn_id}: {response}")
+                                await conn_state.websocket.send_json(response)
+                                conn_state.transcripts_sent += 1
+                                conn_state.update_latency(latency)
+                                self.total_transcripts += 1
+                                self.total_audio_seconds += (
+                                    len(batch_item.audio_data) / self.config.SAMPLE_RATE
                                 )
-                            else:
-                                # No new words — skip this partial entirely.
-                                logger.info(f"[processing_loop] Connection {conn_id} (PARTIAL): No new words. Skipping.")
+                                logger.info(f"Transcribe Hit #{self.total_transcripts} | Conn: {conn_id} | Latency: {latency:.3f}s | Final: {is_final} | Text Length: {len(send_text)}")
+                            except Exception as e:
+                                logger.error(f"[processing_loop] Failed to send transcript to {conn_id}: {e}", exc_info=True)
+                                await self.registry.unregister(conn_id)
                                 continue
-
-                        response = {
-                            "status": "transcribed",
-                            "text": send_text,
-                            "is_final": is_final,
-                            "latency_seconds": latency
-                        }
-                        try:
-                            logger.info(f"[processing_loop] Sending JSON response to connection {conn_id}: {response}")
-                            await conn_state.websocket.send_json(response)
-                            conn_state.transcripts_sent += 1
-                            conn_state.update_latency(latency)
-                            self.total_transcripts += 1
-                            self.total_audio_seconds += (
-                                len(batch_item.audio_data) / self.config.SAMPLE_RATE
-                            )
-                            logger.info(f"Transcribe Hit #{self.total_transcripts} | Conn: {conn_id} | Latency: {latency:.3f}s | Final: {is_final} | Text Length: {len(send_text)}")
-                        except Exception as e:
-                            logger.error(f"[processing_loop] Failed to send transcript to {conn_id}: {e}", exc_info=True)
-                            await self.registry.unregister(conn_id)
-                            continue
+                        else:
+                            # User requested that partial transcripts NOT be sent to the frontend to avoid repeating text bugs.
+                            # We just wait until the utterance is final.
+                            logger.info(f"[processing_loop] Connection {conn_id} (PARTIAL): '{text}'. Skipping send to user.")
                     else:
                         logger.info(f"[processing_loop] Connection {conn_id}: text is empty. Skipping send.")
 
