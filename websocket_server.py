@@ -210,6 +210,10 @@ class STTServer:
     # ── lifecycle ────────────────────────────────────────────────────────────
 
     async def start(self):
+        # Warm up the GPU with a dummy inference to avoid cold start delays
+        if hasattr(self.whisper_engine, 'warmup'):
+            self.whisper_engine.warmup()
+            
         self.is_running = True
         self.worker_task = asyncio.create_task(self.processing_loop())
 

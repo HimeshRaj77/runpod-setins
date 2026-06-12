@@ -225,6 +225,30 @@ class WhisperEngine:
             logger.error(f"Failed to initialise Whisper engine: {e}")
             raise
 
+    # ── warmup ────────────────────────────────────────────────────────────────
+
+    def warmup(self):
+        """Warm up the GPU by running a dummy inference to compile the PyTorch execution graph."""
+        logger.info("[whisper] Warming up the GPU with a dummy inference...")
+        start_time = time.time()
+        # 1 second of silent float32 audio
+        dummy_audio = np.zeros(16000, dtype=np.float32)
+        try:
+            with torch.no_grad():
+                self.pipe(
+                    [dummy_audio],
+                    batch_size=1,
+                    generate_kwargs={
+                        "language": self.language if self.language != "auto" else None,
+                        "task": self.task,
+                        "condition_on_prev_tokens": False,
+                        "temperature": 0.0,
+                    },
+                )
+            logger.info(f"[whisper] GPU warm-up completed in {time.time() - start_time:.3f}s")
+        except Exception as e:
+            logger.error(f"[whisper] Failed to warm up GPU: {e}")
+
     # ── inference ─────────────────────────────────────────────────────────────
 
     def transcribe_batch(
