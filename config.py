@@ -31,7 +31,7 @@ class Config:
     VAD_MIN_SILENCE_DURATION: float = float(os.getenv("VAD_MIN_SILENCE_DURATION", "0.5"))  # seconds
 
     # Dynamic Batching
-    MAX_BATCH_SIZE: int = int(os.getenv("MAX_BATCH_SIZE", "16"))
+    MAX_BATCH_SIZE: int = int(os.getenv("MAX_BATCH_SIZE", "4"))
     MAX_BATCH_WAIT_MS: float = float(os.getenv("MAX_BATCH_WAIT_MS", "50"))
     MIN_BATCH_WAIT_MS: float = float(os.getenv("MIN_BATCH_WAIT_MS", "10"))
 
